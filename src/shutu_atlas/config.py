@@ -10,7 +10,7 @@ DEFAULT_EXCLUDED_DIRS = {
     ".git", ".local", ".venv", "venv", "node_modules", "dist", "build",
     "coverage", ".pytest_cache", "__pycache__", ".mypy_cache", ".ruff_cache",
     ".next", ".cache", ".pnpm-store", ".yarn", ".gradle", ".idea", ".vscode", ".turbo",
-    ".parcel-cache", "target", "bin", "obj", "vendor", "tmp", "temp", "cache", "logs", "out",
+    ".parcel-cache", ".codex", ".opencode", ".serena", ".agent", ".agents", "target", "bin", "obj", "vendor", "tmp", "temp", "cache", "logs", "out",
 }
 
 

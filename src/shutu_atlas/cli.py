@@ -17,6 +17,10 @@ from .mcp_server.server import run_stdio
 from .symbols.providers import FallbackProvider, SerenaProvider
 
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
 def _config(args: argparse.Namespace) -> AtlasConfig:
     cfg = load_config(Path(args.config) if args.config else None)
     if getattr(args, "root", None):
