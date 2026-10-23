@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Shutu-Atlas · UI Gallery</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar"><div><p class="eyebrow">SHUTU · ATLAS / V2</p><h1>代码与 UI 资产参考库</h1><p class="sub">只读证据 · 本地索引 · 可追溯源码</p></div><button id="theme" class="ghost">切换主题</button></header>
+  <main class="shell">
+    <section class="hero"><div><span class="pill">READ-ONLY GALLERY</span><h2>从真实项目里找到下一次实现的起点。</h2><p>搜索 UI 页面、组件、样式和代码定位。没有真实截图的资产会明确显示未采集，不使用合成素材。</p></div><div class="hero-stat"><strong id="projectCount">—</strong><span>已索引项目</span></div></section>
+    <section class="toolbar"><label>关键词<input id="query" value="dashboard" placeholder="dark KPI dashboard" /></label><label>项目<select id="project"><option value="">全部项目</option></select></label><button id="search" class="primary">搜索资产</button><button id="code" class="secondary">搜索代码</button></section>
+    <section id="notice" class="notice" hidden></section>
+    <section id="results" class="grid" aria-live="polite"></section>
+  </main>
+  <dialog id="detail"><button class="close" id="close">×</button><div id="detailBody"></div></dialog>
+  <script src="/app.js"></script>
+</body>
+</html>
+

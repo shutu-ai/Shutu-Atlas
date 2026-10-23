@@ -1,0 +1,17 @@
+.local/
+atlas.toml
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+web/node_modules/
+web/dist/
+tests/.test-work/
+tests/.test-tmp/
+tests/.test-work-check/
+.codegraph/
+pytest-cache-files-*/
+

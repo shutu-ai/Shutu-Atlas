@@ -1,0 +1,20 @@
+# 复制为 atlas.toml 后按本机实际目录调整。不要把个人绝对路径写进源码。
+[paths]
+db = ".local/atlas.sqlite3"
+gallery = ".local/gallery"
+serena_workspaces = ".local/serena-workspaces"
+
+[scan]
+roots = ["D:/dev-projects"]
+include_projects = []
+exclude_projects = ["Shutu-Atlas"]
+excluded_dirs = [".git", ".local", "node_modules", ".venv", "dist", "build", "coverage", "__pycache__"]
+
+[limits]
+max_file_bytes = 512000
+max_files_per_project = 20000
+max_results = 50
+max_snippet_lines = 12
+max_chars = 8000
+command_timeout_seconds = 8.0
+

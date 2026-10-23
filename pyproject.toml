@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shutu-atlas"
+version = "0.2.0"
+description = "本地优先的跨项目代码与 UI 资产参考库"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+atlas = "shutu_atlas.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["fixtures", ".test-tmp", ".test-work"]
+addopts = "-p no:cacheprovider"
+pythonpath = ["src"]
+
