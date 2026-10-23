@@ -49,9 +49,7 @@ class McpService:
             return self.store.ui_detail(str(args.get("asset_id", "")))
         if name == "atlas_suggest_reuse":
             requirement = str(args.get("requirement", ""))
-            capability = self.store.find_capability(requirement, min(limit, 3))
-            ui = self.store.find_ui(requirement, min(limit, 3))
-            return {"status": "ok", "source": "indexed-evidence", "requirement": requirement, "target_stack": args.get("target_stack"), "candidates": capability.get("results", [])[:3], "ui_candidates": ui.get("results", [])[:3], "reuse_types": ["reuse_direct", "adapt", "visual_reference", "unknown"], "warnings": ["候选是静态证据；实施前请用 atlas_get_source 核验依赖、许可证和测试"]}
+            return self.store.suggest_reuse(requirement, args.get("target_stack"), min(limit, 3))
         if name == "atlas_health":
             result = self.store.status()
             result["rg"] = {"available": __import__("shutil").which("rg") is not None}

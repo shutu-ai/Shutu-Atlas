@@ -13,7 +13,7 @@ import time
 from typing import Any
 
 from ..config import AtlasConfig
-from ..discovery import ProjectRecord, iter_project_files, safe_source_path
+from ..discovery import ProjectRecord, allowed_source_path, iter_project_files
 
 
 SCHEMA = """
@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS capabilities (
   capability_id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
   name TEXT NOT NULL, label TEXT NOT NULL, status TEXT NOT NULL,
   manual_status TEXT, manual_label TEXT, manual_note TEXT, reviewed_at TEXT,
+  manual_git_head TEXT, manual_evidence_hash TEXT,
   updated_at TEXT NOT NULL,
   UNIQUE(project_id, name)
 );
@@ -61,6 +62,11 @@ CREATE TABLE IF NOT EXISTS ui_source_links (
   asset_id TEXT NOT NULL REFERENCES ui_assets(asset_id) ON DELETE CASCADE,
   file_id INTEGER NOT NULL REFERENCES files(file_id) ON DELETE CASCADE,
   start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, PRIMARY KEY(asset_id, file_id)
+);
+CREATE TABLE IF NOT EXISTS ui_asset_aliases (
+  old_asset_id TEXT PRIMARY KEY,
+  new_asset_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS index_runs (
   run_id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, finished_at TEXT,
@@ -93,10 +99,23 @@ CAPABILITY_RULES: list[tuple[str, str, tuple[str, ...]]] = [
 ]
 
 UI_EXTENSIONS = {".vue": "page_or_component", ".tsx": "page_or_component", ".jsx": "page_or_component", ".html": "page", ".css": "style", ".scss": "style"}
+SCREENSHOT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
 
 def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _ui_asset_id(relative_path: str, project_id: str | None = None) -> str:
+    """Return a stable UI identity scoped to the owning project.
+
+    The optional project argument keeps the helper source-compatible for older
+    callers, while every index write supplies it to prevent cross-repository
+    collisions for identical relative paths.
+    """
+
+    identity = relative_path if not project_id else f"{project_id}\0{relative_path}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
 
 def _process_alive(pid: int | None) -> bool:
@@ -129,6 +148,11 @@ def init_db(cfg: AtlasConfig) -> None:
     cfg.ensure_local_dirs()
     with connect(cfg.db_path) as conn:
         conn.executescript(SCHEMA)
+        version_row = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+        try:
+            schema_version = int(version_row[0]) if version_row else 1
+        except (TypeError, ValueError):
+            schema_version = 1
         run_columns = {row[1] for row in conn.execute("PRAGMA table_info(index_runs)")}
         if "owner_pid" not in run_columns:
             conn.execute("ALTER TABLE index_runs ADD COLUMN owner_pid INTEGER")
@@ -138,11 +162,72 @@ def init_db(cfg: AtlasConfig) -> None:
             ("manual_label", "TEXT"),
             ("manual_note", "TEXT"),
             ("reviewed_at", "TEXT"),
+            ("manual_git_head", "TEXT"),
+            ("manual_evidence_hash", "TEXT"),
         ):
             if column not in capability_columns:
                 conn.execute(f"ALTER TABLE capabilities ADD COLUMN {column} {definition}")
-        conn.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '3')")
+        if schema_version < 4:
+            _migrate_ui_asset_ids(conn)
+        conn.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '4')")
         conn.commit()
+
+
+def _migrate_ui_asset_ids(conn: sqlite3.Connection) -> None:
+    """Migrate v1-v3 path-only UI IDs to project-scoped IDs.
+
+    The migration inserts the new parent and source-link rows before removing
+    the old parent, so it works with foreign keys enabled.  Old IDs remain
+    resolvable through ``ui_asset_aliases``; this preserves bookmarks and
+    imported screenshot references from earlier databases.
+    """
+
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS ui_asset_aliases (
+            old_asset_id TEXT PRIMARY KEY,
+            new_asset_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )"""
+    )
+    rows = conn.execute(
+        """SELECT u.*, f.relative_path
+           FROM ui_assets u
+           LEFT JOIN files f ON f.file_id=u.file_id
+          WHERE f.relative_path IS NOT NULL"""
+    ).fetchall()
+    for row in rows:
+        old_id = row["asset_id"]
+        new_id = _ui_asset_id(row["relative_path"], row["project_id"])
+        if old_id == new_id:
+            continue
+        if conn.execute("SELECT 1 FROM ui_assets WHERE asset_id=?", (new_id,)).fetchone():
+            # The normal 24-character identity is already collision-resistant;
+            # use a deterministic longer fallback if a hand-crafted legacy DB
+            # contains an unexpected duplicate.
+            new_id = hashlib.sha256(
+                f"{row['project_id']}\0{row['relative_path']}\0{old_id}".encode("utf-8")
+            ).hexdigest()[:32]
+        conn.execute(
+            """INSERT INTO ui_assets(
+                asset_id,project_id,file_id,asset_type,name,search_text,features_json,
+                screenshot_status,screenshot_path,confidence,updated_at
+            ) SELECT ?,project_id,file_id,asset_type,name,search_text,features_json,
+                     screenshot_status,screenshot_path,confidence,updated_at
+                FROM ui_assets WHERE asset_id=?""",
+            (new_id, old_id),
+        )
+        conn.execute(
+            """INSERT INTO ui_source_links(asset_id,file_id,start_line,end_line)
+               SELECT ?,file_id,start_line,end_line
+                 FROM ui_source_links WHERE asset_id=?""",
+            (new_id, old_id),
+        )
+        conn.execute("DELETE FROM ui_source_links WHERE asset_id=?", (old_id,))
+        conn.execute("DELETE FROM ui_assets WHERE asset_id=?", (old_id,))
+        conn.execute(
+            "INSERT OR REPLACE INTO ui_asset_aliases(old_asset_id,new_asset_id,created_at) VALUES(?,?,?)",
+            (old_id, new_id, utc_now()),
+        )
 
 
 def _sha256(path: Path) -> str:
@@ -197,7 +282,7 @@ def detect_capabilities(text: str, language: str = "") -> list[dict[str, Any]]:
     return results
 
 
-def detect_ui_asset(relative_path: str, text: str) -> dict[str, Any] | None:
+def detect_ui_asset(relative_path: str, text: str, project_id: str | None = None) -> dict[str, Any] | None:
     suffix = Path(relative_path).suffix.lower()
     if suffix not in UI_EXTENSIONS:
         return None
@@ -207,7 +292,7 @@ def detect_ui_asset(relative_path: str, text: str) -> dict[str, Any] | None:
         if needle in folded:
             features.append(label)
     name = Path(relative_path).stem
-    asset_id = hashlib.sha256(relative_path.encode("utf-8")).hexdigest()[:20]
+    asset_id = _ui_asset_id(relative_path, project_id)
     return {"asset_id": asset_id, "asset_type": UI_EXTENSIONS[suffix], "name": name, "features": sorted(set(features)), "search_text": f"{name} {relative_path} {' '.join(features)} {text[:1500]}", "start_line": 1, "end_line": min(len(text.splitlines()), 80)}
 
 
@@ -310,6 +395,10 @@ class IndexStore:
         now = utc_now()
         self._upsert_project(conn, project)
         old = {row["relative_path"]: dict(row) for row in conn.execute("SELECT * FROM files WHERE project_id=?", (project.project_id,))}
+        old_assets = {
+            row["file_id"]: dict(row)
+            for row in conn.execute("SELECT * FROM ui_assets WHERE project_id=?", (project.project_id,))
+        }
         seen: set[str] = set()
         changed = 0
         for path, relative in iter_project_files(project, self.cfg):
@@ -339,11 +428,30 @@ class IndexStore:
                 )
                 cap_id = conn.execute("SELECT capability_id FROM capabilities WHERE project_id=? AND name=?", (project.project_id, cap["name"])).fetchone()[0]
                 conn.execute("INSERT INTO capability_evidence(capability_id,file_id,start_line,end_line,snippet,reason) VALUES(?,?,?,?,?,?)", (cap_id, file_id, cap["line"], cap["line"], cap["snippet"], cap["reason"]))
+            previous_asset = old_assets.get(file_id)
             conn.execute("DELETE FROM ui_source_links WHERE file_id=?", (file_id,))
             conn.execute("DELETE FROM ui_assets WHERE file_id=?", (file_id,))
-            asset = detect_ui_asset(relative, text)
+            asset = detect_ui_asset(relative, text, project.project_id)
             if asset:
-                conn.execute("INSERT OR REPLACE INTO ui_assets(asset_id,project_id,file_id,asset_type,name,search_text,features_json,screenshot_status,screenshot_path,confidence,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (asset["asset_id"], project.project_id, file_id, asset["asset_type"], asset["name"], asset["search_text"], json.dumps(asset["features"], ensure_ascii=False), "unavailable", None, "inferred", now))
+                screenshot_status, screenshot_path = self._preserved_screenshot(previous_asset)
+                conn.execute(
+                    """INSERT INTO ui_assets(
+                        asset_id,project_id,file_id,asset_type,name,search_text,features_json,
+                        screenshot_status,screenshot_path,confidence,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(asset_id) DO UPDATE SET
+                        project_id=excluded.project_id,file_id=excluded.file_id,
+                        asset_type=excluded.asset_type,name=excluded.name,
+                        search_text=excluded.search_text,features_json=excluded.features_json,
+                        screenshot_status=excluded.screenshot_status,
+                        screenshot_path=excluded.screenshot_path,
+                        confidence=excluded.confidence,updated_at=excluded.updated_at""",
+                    (
+                        asset["asset_id"], project.project_id, file_id, asset["asset_type"], asset["name"],
+                        asset["search_text"], json.dumps(asset["features"], ensure_ascii=False),
+                        screenshot_status, screenshot_path, "inferred", now,
+                    ),
+                )
                 conn.execute("INSERT OR REPLACE INTO ui_source_links(asset_id,file_id,start_line,end_line) VALUES(?,?,?,?)", (asset["asset_id"], file_id, asset["start_line"], asset["end_line"]))
             changed += 1
         for relative, row in old.items():
@@ -353,6 +461,23 @@ class IndexStore:
                 conn.execute("DELETE FROM capabilities WHERE project_id=? AND capability_id NOT IN (SELECT DISTINCT c.capability_id FROM capabilities c JOIN capability_evidence e ON e.capability_id=c.capability_id WHERE c.project_id=?)", (project.project_id, project.project_id))
         conn.execute("UPDATE projects SET file_count=(SELECT count(*) FROM files WHERE project_id=?) WHERE project_id=?", (project.project_id, project.project_id))
         return changed
+
+    def _preserved_screenshot(self, previous_asset: dict[str, Any] | None) -> tuple[str, str | None]:
+        """Keep a user-imported screenshot when a UI source file is reindexed."""
+
+        if not previous_asset or previous_asset.get("screenshot_status") != "available":
+            return "unavailable", None
+        screenshot_path = previous_asset.get("screenshot_path")
+        if not screenshot_path:
+            return "unavailable", None
+        try:
+            gallery_root = self.cfg.gallery_dir.resolve()
+            target = (self.cfg.project_root / screenshot_path).resolve()
+            if gallery_root not in target.parents or not target.is_file():
+                return "unavailable", None
+            return "available", screenshot_path
+        except (OSError, ValueError):
+            return "unavailable", None
 
     def list_projects(self, filter_text: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         limit = min(max(1, limit), self.cfg.limits.max_results)
@@ -381,16 +506,21 @@ class IndexStore:
 
     def search_code(self, query: str, limit: int = 10, project_id: str | None = None, language: str | None = None) -> dict[str, Any]:
         limit = min(max(1, limit), self.cfg.limits.max_results)
+        project_id = project_id.strip() if isinstance(project_id, str) and project_id.strip() else None
         terms = _query_terms(query)
         fts_query = " OR ".join('"' + t.replace('"', ' ') + '"' for t in terms)
         results: list[dict[str, Any]] = []
         with connect(self.cfg.db_path, readonly=True) as conn:
-            sql = "SELECT f.project_id,f.file_id,f.relative_path,f.language,p.git_head,p.branch,p.dirty,s.highlight FROM fts_content f JOIN (SELECT project_id,file_id,relative_path,language,content,highlight(fts_content,4,'[HIGHLIGHT]','[/HIGHLIGHT]') AS highlight FROM fts_content WHERE fts_content MATCH ?) s ON s.file_id=f.file_id JOIN projects p ON p.project_id=f.project_id WHERE (? IS NULL OR f.project_id=?) AND (? IS NULL OR f.language=?) LIMIT ?"
+            sql = "SELECT f.project_id,f.file_id,f.relative_path,f.language,p.path,p.git_head,p.branch,p.dirty,s.highlight FROM fts_content f JOIN (SELECT project_id,file_id,relative_path,language,content,highlight(fts_content,4,'[HIGHLIGHT]','[/HIGHLIGHT]') AS highlight FROM fts_content WHERE fts_content MATCH ?) s ON s.file_id=f.file_id JOIN projects p ON p.project_id=f.project_id WHERE p.excluded=0 AND (? IS NULL OR f.project_id=?) AND (? IS NULL OR f.language=?) LIMIT ?"
             try:
                 rows = conn.execute(sql, (fts_query, project_id, project_id, language, language, limit)).fetchall()
             except sqlite3.OperationalError:
                 rows = []
             for row in rows:
+                try:
+                    allowed_source_path(Path(row["path"]), row["relative_path"], self.cfg)
+                except (OSError, ValueError):
+                    continue
                 results.append({"project_id": row["project_id"], "file_id": row["file_id"], "relative_path": row["relative_path"], "language": row["language"], "git_head": row["git_head"], "branch": row["branch"], "dirty": None if row["dirty"] is None else bool(row["dirty"]), "snippet": row["highlight"][: self.cfg.limits.max_chars], "match_reason": "fts", "evidence": "SQLite FTS5 BM25 candidate"})
         for item in self._rg_search(query, limit, project_id, language):
             if not any(r["project_id"] == item["project_id"] and r["relative_path"] == item["relative_path"] and r.get("line") == item.get("line") for r in results):
@@ -402,31 +532,70 @@ class IndexStore:
     def _rg_search(self, query: str, limit: int, project_id: str | None, language: str | None) -> list[dict[str, Any]]:
         if not shutil.which("rg"):
             return []
+        project_id = project_id.strip() if isinstance(project_id, str) and project_id.strip() else None
         with connect(self.cfg.db_path, readonly=True) as conn:
-            rows = conn.execute("SELECT project_id,path,git_head,branch,dirty FROM projects WHERE excluded=0 AND (? IS NULL OR project_id=?)", (project_id, project_id)).fetchall()
+            rows = conn.execute(
+                """SELECT p.project_id,p.path,p.git_head,p.branch,p.dirty,f.file_id,f.relative_path
+                   FROM projects p JOIN files f ON f.project_id=p.project_id
+                  WHERE p.excluded=0 AND (? IS NULL OR p.project_id=?)
+                  ORDER BY p.project_id,f.relative_path""",
+                (project_id, project_id),
+            ).fetchall()
         results: list[dict[str, Any]] = []
+        grouped: dict[str, list[sqlite3.Row]] = {}
         for row in rows:
-            try:
-                proc = subprocess.run(["rg", "--line-number", "--no-heading", "--color", "never", "--fixed-strings", "--max-count", "3", "--glob", "!.git/**", "--glob", "!.local/**", "--glob", "!node_modules/**", "--glob", "!.env*", "--", query, row["path"]], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=self.cfg.limits.command_timeout_seconds, check=False)
-            except (OSError, subprocess.TimeoutExpired):
-                continue
+            grouped.setdefault(row["project_id"], []).append(row)
+        for project_rows in grouped.values():
+            row = project_rows[0]
             root = Path(row["path"]).resolve()
-            for raw in proc.stdout.splitlines():
-                match = re.match(r"^(.*):(\d+):(.*)$", raw)
-                if not match:
-                    continue
-                path, line, text = match.groups()
+            allowed: dict[str, int] = {}
+            for candidate in project_rows:
+                rel = Path(candidate["relative_path"]).as_posix()
                 try:
-                    rel = Path(path).resolve().relative_to(root).as_posix()
-                except ValueError:
+                    allowed_source_path(root, rel, self.cfg)
+                except (OSError, ValueError):
                     continue
-                if language and _language(rel) != language:
+                allowed[rel] = int(candidate["file_id"])
+            if not allowed:
+                continue
+            # Pass only indexed/allowed relative paths to rg.  This avoids
+            # relying on a partially overlapping glob blacklist and prevents
+            # ignored, hidden, excluded or linked files from being searched.
+            allowed_paths = list(allowed)
+            for offset in range(0, len(allowed_paths), 128):
+                chunk = allowed_paths[offset:offset + 128]
+                try:
+                    proc = subprocess.run(
+                        [
+                            "rg", "--line-number", "--no-heading", "--color", "never",
+                            "--fixed-strings", "--max-count", "3", "--no-ignore", "--",
+                            query, *chunk,
+                        ],
+                        cwd=root,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=self.cfg.limits.command_timeout_seconds,
+                        check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
                     continue
-                with connect(self.cfg.db_path, readonly=True) as local:
-                    file_row = local.execute("SELECT file_id FROM files WHERE project_id=? AND relative_path=?", (row["project_id"], rel)).fetchone()
-                results.append({"project_id": row["project_id"], "file_id": file_row[0] if file_row else None, "relative_path": rel, "language": _language(rel), "git_head": row["git_head"], "branch": row["branch"], "dirty": None if row["dirty"] is None else bool(row["dirty"]), "line": int(line), "snippet": text[: self.cfg.limits.max_chars], "match_reason": "regex", "evidence": "ripgrep fixed-string match"})
-                if len(results) >= limit:
-                    return results
+                for raw in proc.stdout.splitlines():
+                    match = re.match(r"^(.*):(\d+):(.*)$", raw)
+                    if not match:
+                        continue
+                    path, line, text = match.groups()
+                    rel = Path(path).as_posix()
+                    if rel.startswith("./"):
+                        rel = rel[2:]
+                    if rel not in allowed:
+                        continue
+                    if language and _language(rel) != language:
+                        continue
+                    results.append({"project_id": row["project_id"], "file_id": allowed[rel], "relative_path": rel, "language": _language(rel), "git_head": row["git_head"], "branch": row["branch"], "dirty": None if row["dirty"] is None else bool(row["dirty"]), "line": int(line), "snippet": text[: self.cfg.limits.max_chars], "match_reason": "regex", "evidence": "ripgrep fixed-string match"})
+                    if len(results) >= limit:
+                        return results
         return results
 
     def find_capability(self, query: str, limit: int = 10, project_filter: str | None = None) -> dict[str, Any]:
@@ -441,11 +610,85 @@ class IndexStore:
             if project_filter:
                 conditions.append("(p.name LIKE ? OR p.project_id=?)")
                 params.extend([f"%{project_filter}%", project_filter])
-            rows = conn.execute(f"SELECT c.name,COALESCE(c.manual_label,c.label) AS label,COALESCE(c.manual_status,c.status) AS status,c.manual_note,c.reviewed_at,p.project_id,p.name AS project_name,p.path,p.git_head,p.branch,p.dirty,e.file_id,f.language,f.relative_path,e.start_line,e.end_line,e.snippet,e.reason FROM capabilities c JOIN projects p ON p.project_id=c.project_id JOIN capability_evidence e ON e.capability_id=c.capability_id JOIN files f ON f.file_id=e.file_id WHERE {' AND '.join(conditions)} ORDER BY CASE COALESCE(c.manual_status,c.status) WHEN 'verified' THEN 0 WHEN 'inferred' THEN 1 ELSE 2 END, CASE WHEN f.language IN ('Markdown','JSON','TOML','Text') THEN 1 ELSE 0 END, p.name LIMIT ?", (*params, limit)).fetchall()
+            rows = conn.execute(
+                f"""SELECT c.capability_id,c.name,
+                           COALESCE(c.manual_label,c.label) AS label,
+                           c.status AS inferred_status,c.manual_status,c.manual_note,c.reviewed_at,
+                           c.manual_git_head,c.manual_evidence_hash,
+                           p.project_id,p.name AS project_name,p.path,p.git_head,p.branch,p.dirty,
+                           p.languages_json,p.frameworks_json,p.markers_json,
+                           e.file_id,f.language,f.relative_path,e.start_line,e.end_line,e.snippet,e.reason
+                      FROM capabilities c
+                      JOIN projects p ON p.project_id=c.project_id
+                      JOIN capability_evidence e ON e.capability_id=c.capability_id
+                      JOIN files f ON f.file_id=e.file_id
+                     WHERE p.excluded=0 AND {' AND '.join(conditions)}
+                     ORDER BY CASE COALESCE(c.manual_status,c.status)
+                                WHEN 'verified' THEN 0 WHEN 'inferred' THEN 1 ELSE 2 END,
+                              CASE WHEN f.language IN ('Markdown','JSON','TOML','Text') THEN 1 ELSE 0 END,
+                              p.name LIMIT ?""",
+                (*params, limit),
+            ).fetchall()
         results = [dict(row) for row in rows]
+        fingerprint_cache: dict[int, str] = {}
+        warnings: list[str] = []
         for item in results:
             item["dirty"] = None if item["dirty"] is None else bool(item["dirty"])
-        return {"status": "ok", "query": query, "terms": terms, "results": results, "warnings": []}
+            item["languages"] = json.loads(item.pop("languages_json"))
+            item["frameworks"] = json.loads(item.pop("frameworks_json"))
+            item["markers"] = json.loads(item.pop("markers_json"))
+            capability_id = int(item["capability_id"])
+            if capability_id not in fingerprint_cache:
+                with connect(self.cfg.db_path, readonly=True) as live_conn:
+                    fingerprint_cache[capability_id] = self._capability_evidence_fingerprint(live_conn, capability_id)
+            current_hash = fingerprint_cache[capability_id]
+            manual_status = item.get("manual_status")
+            expired = bool(
+                manual_status == "verified"
+                and (
+                    not item.get("manual_evidence_hash")
+                    or item.get("manual_evidence_hash") != current_hash
+                    or (
+                        item.get("git_head") is not None
+                        and item.get("manual_git_head") != item.get("git_head")
+                    )
+                )
+            )
+            item["status"] = "expired" if expired else (manual_status or item["inferred_status"])
+            item["review_status"] = "expired" if expired else (manual_status or item["inferred_status"])
+            item["verification_expired"] = expired
+            item["source_version"] = {
+                "indexed_git_head": item.get("git_head"),
+                "reviewed_git_head": item.get("manual_git_head"),
+                "current_evidence_hash": current_hash,
+                "reviewed_evidence_hash": item.get("manual_evidence_hash"),
+            }
+            if expired:
+                warnings.append(f"{item['project_name']}:{item['name']} verification expired; source evidence changed")
+        results.sort(key=lambda item: {"verified": 0, "expired": 1, "inferred": 2, "unverified": 3}.get(item["status"], 4))
+        return {"status": "ok", "query": query, "terms": terms, "results": results, "warnings": list(dict.fromkeys(warnings))}
+
+    def _capability_evidence_fingerprint(self, conn: sqlite3.Connection, capability_id: int) -> str:
+        """Hash the current source bytes and evidence ranges for one capability."""
+
+        rows = conn.execute(
+            """SELECT f.relative_path,f.sha256,p.path,e.start_line,e.end_line
+                 FROM capability_evidence e
+                 JOIN files f ON f.file_id=e.file_id
+                 JOIN projects p ON p.project_id=f.project_id
+                WHERE e.capability_id=?
+                ORDER BY f.relative_path,e.start_line,e.end_line""",
+            (capability_id,),
+        ).fetchall()
+        digest = hashlib.sha256()
+        for row in rows:
+            current_hash = row["sha256"]
+            try:
+                current_hash = _sha256(allowed_source_path(Path(row["path"]), row["relative_path"], self.cfg))
+            except (OSError, ValueError):
+                current_hash = "missing"
+            digest.update(f"{row['relative_path']}\0{row['start_line']}\0{row['end_line']}\0{current_hash}\n".encode("utf-8"))
+        return digest.hexdigest()
 
     def confirm_capability(
         self,
@@ -461,15 +704,30 @@ class IndexStore:
             return {"status": "invalid_request", "warnings": ["status must be verified, inferred, or unverified"]}
         with connect(self.cfg.db_path) as conn:
             row = conn.execute(
-                "SELECT capability_id,label FROM capabilities WHERE project_id=? AND name=?",
+                """SELECT c.capability_id,c.label,p.git_head
+                     FROM capabilities c JOIN projects p ON p.project_id=c.project_id
+                    WHERE c.project_id=? AND c.name=?""",
                 (project_id, name),
             ).fetchone()
             if not row:
                 return {"status": "not_found", "warnings": ["capability is not indexed for this project"]}
             reviewed_at = utc_now()
+            evidence_hash = self._capability_evidence_fingerprint(conn, int(row["capability_id"]))
             conn.execute(
-                "UPDATE capabilities SET manual_status=?,manual_label=?,manual_note=?,reviewed_at=?,updated_at=? WHERE capability_id=?",
-                (status, label.strip() if label and label.strip() else None, note.strip() if note and note.strip() else None, reviewed_at, reviewed_at, row["capability_id"]),
+                """UPDATE capabilities
+                      SET manual_status=?,manual_label=?,manual_note=?,reviewed_at=?,
+                          manual_git_head=?,manual_evidence_hash=?,updated_at=?
+                    WHERE capability_id=?""",
+                (
+                    status,
+                    label.strip() if label and label.strip() else None,
+                    note.strip() if note and note.strip() else None,
+                    reviewed_at,
+                    row["git_head"],
+                    evidence_hash,
+                    reviewed_at,
+                    row["capability_id"],
+                ),
             )
             conn.commit()
         return {
@@ -479,6 +737,7 @@ class IndexStore:
             "effective_status": status,
             "label": label.strip() if label and label.strip() else row["label"],
             "reviewed_at": reviewed_at,
+            "source_version": {"reviewed_git_head": row["git_head"], "reviewed_evidence_hash": evidence_hash},
             "warnings": ["Hub-local review metadata only; source project was not modified"],
         }
 
@@ -493,6 +752,7 @@ class IndexStore:
 
     def find_ui(self, query: str, limit: int = 12, project_id: str | None = None) -> dict[str, Any]:
         limit = min(max(1, limit), self.cfg.limits.max_results)
+        project_id = project_id.strip() if isinstance(project_id, str) and project_id.strip() else None
         terms = _query_terms(query)
         conditions = ["(" + " OR ".join("u.search_text LIKE ?" for _ in terms) + ")"]
         params: list[Any] = [f"%{term}%" for term in terms]
@@ -500,11 +760,32 @@ class IndexStore:
             conditions.append("u.project_id=?")
             params.append(project_id)
         with connect(self.cfg.db_path, readonly=True) as conn:
-            rows = conn.execute(f"SELECT u.*,p.name AS project_name,p.path,p.git_head,p.branch,p.dirty,f.file_id,f.relative_path FROM ui_assets u JOIN projects p ON p.project_id=u.project_id LEFT JOIN files f ON f.file_id=u.file_id WHERE {' AND '.join(conditions)} ORDER BY u.name LIMIT ?", (*params, limit)).fetchall()
-        results = [dict(row) for row in rows]
-        for item in results:
+            rows = conn.execute(
+                f"""SELECT u.*,p.name AS project_name,p.path,p.git_head,p.branch,p.dirty,
+                           p.languages_json,p.frameworks_json,p.markers_json,
+                           f.file_id,f.relative_path
+                      FROM ui_assets u
+                      JOIN projects p ON p.project_id=u.project_id
+                      LEFT JOIN files f ON f.file_id=u.file_id
+                     WHERE p.excluded=0 AND {' AND '.join(conditions)}
+                     ORDER BY u.name LIMIT ?""",
+                (*params, limit),
+            ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            if item.get("relative_path"):
+                try:
+                    allowed_source_path(Path(item["path"]), item["relative_path"], self.cfg)
+                except (OSError, ValueError):
+                    continue
             item["features"] = json.loads(item.pop("features_json"))
+            item["languages"] = json.loads(item.pop("languages_json"))
+            item["frameworks"] = json.loads(item.pop("frameworks_json"))
+            item["markers"] = json.loads(item.pop("markers_json"))
+            item["screenshot_url"] = f"/assets/{item['asset_id']}" if item["screenshot_status"] == "available" else None
             item["dirty"] = None if item["dirty"] is None else bool(item["dirty"])
+            results.append(item)
         return {"status": "ok", "query": query, "terms": terms, "results": results, "warnings": ["No real screenshot is claimed unless screenshot_status=available"]}
 
     def get_source(self, project_id: str, file_id: int, start_line: int = 1, end_line: int | None = None) -> dict[str, Any]:
@@ -513,7 +794,7 @@ class IndexStore:
         if not row:
             return {"status": "not_found", "warnings": ["file is not indexed"]}
         try:
-            path = safe_source_path(Path(row["path"]), row["relative_path"])
+            path = allowed_source_path(Path(row["path"]), row["relative_path"], self.cfg)
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except (OSError, ValueError) as exc:
             return {"status": "denied", "warnings": [str(exc)]}
@@ -523,6 +804,8 @@ class IndexStore:
         return {"status": "ok", "project_id": project_id, "file_id": file_id, "relative_path": row["relative_path"], "start_line": start, "end_line": end, "text": "\n".join(f"{i}: {lines[i - 1]}" for i in range(start, end + 1))[: self.cfg.limits.max_chars], "git_head": row["git_head"], "dirty": bool(row["dirty"]) if row["dirty"] is not None else None, "stale": current_hash != row["sha256"], "warnings": [] if current_hash == row["sha256"] else ["source changed since indexing"]}
 
     def ui_detail(self, asset_id: str) -> dict[str, Any]:
+        requested_asset_id = asset_id
+        asset_id = self._resolve_asset_id(asset_id)
         with connect(self.cfg.db_path, readonly=True) as conn:
             row = conn.execute("SELECT u.*,p.name AS project_name,p.project_id,p.path,p.git_head,p.branch,p.dirty,f.file_id,f.relative_path,l.start_line,l.end_line FROM ui_assets u JOIN projects p ON p.project_id=u.project_id LEFT JOIN files f ON f.file_id=u.file_id LEFT JOIN ui_source_links l ON l.asset_id=u.asset_id WHERE u.asset_id=?", (asset_id,)).fetchone()
         if not row:
@@ -530,12 +813,104 @@ class IndexStore:
         result = dict(row)
         result["features"] = json.loads(result.pop("features_json"))
         result["dirty"] = None if result["dirty"] is None else bool(result["dirty"])
+        result["requested_asset_id"] = requested_asset_id
+        result["asset_id_alias"] = requested_asset_id if requested_asset_id != asset_id else None
+        result["screenshot_url"] = f"/assets/{asset_id}" if result["screenshot_status"] == "available" else None
         result["reference_prompt"] = f"参考 UI 资产 {asset_id}：项目 {result['project_name']}，源码 {result['relative_path']} 行 {result['start_line']}-{result['end_line']}。只借鉴布局/视觉线索，先核验源码和许可证。"
         return {"status": "ok", "asset": result, "warnings": []}
+
+    def _resolve_asset_id(self, asset_id: str) -> str:
+        current = asset_id
+        with connect(self.cfg.db_path, readonly=True) as conn:
+            for _ in range(8):
+                row = conn.execute("SELECT new_asset_id FROM ui_asset_aliases WHERE old_asset_id=?", (current,)).fetchone()
+                if not row or row[0] == current:
+                    break
+                current = row[0]
+        return current
+
+    def suggest_reuse(self, requirement: str, target_stack: str | None = None, limit: int = 3) -> dict[str, Any]:
+        """Return evidence-shaped reuse candidates without claiming keyword reuse.
+
+        Functional candidates are direct only after a current manual review and
+        an explicit target-stack match.  UI candidates are always visual
+        references; their existence never proves that the behavior is reusable.
+        """
+
+        limit = min(max(1, limit), 3)
+        capabilities = self.find_capability(requirement, limit)
+        ui_assets = self.find_ui(requirement, limit)
+        target_tokens = set(re.findall(r"[a-z0-9+#.-]+", (target_stack or "").casefold()))
+
+        def enrich(item: dict[str, Any], kind: str) -> dict[str, Any]:
+            languages = list(item.get("languages", []))
+            frameworks = list(item.get("frameworks", []))
+            markers = list(item.get("markers", []))
+            stack_tokens = {str(value).casefold() for value in languages + frameworks}
+            overlap = bool(target_tokens & stack_tokens)
+            if not target_stack:
+                risk = "unknown"
+            elif overlap:
+                risk = "low" if kind == "capability" and item.get("status") == "verified" else "medium"
+            else:
+                risk = "high"
+
+            if kind == "ui":
+                reuse_type = "visual_reference"
+            elif item.get("status") in {"expired", "unverified"}:
+                reuse_type = "not_recommended"
+            elif item.get("status") == "verified" and overlap:
+                reuse_type = "reuse_direct"
+            else:
+                reuse_type = "adapt"
+
+            evidence_source = {
+                "project_id": item.get("project_id"),
+                "project_name": item.get("project_name"),
+                "relative_path": item.get("relative_path"),
+                "file_id": item.get("file_id"),
+                "start_line": item.get("start_line"),
+                "end_line": item.get("end_line"),
+                "reason": item.get("reason") or item.get("match_reason") or "ui source mapping",
+                "git_head": item.get("git_head"),
+                "dirty": item.get("dirty"),
+            }
+            if kind == "ui":
+                evidence_source["screenshot_status"] = item.get("screenshot_status")
+            return {
+                **item,
+                "candidate_kind": kind,
+                "candidate_stack": {"languages": languages, "frameworks": frameworks},
+                "dependency_clues": [f"marker:{marker}" for marker in markers]
+                + [f"framework:{framework}" for framework in frameworks],
+                "evidence_source": evidence_source,
+                "adaptation_risk": risk,
+                "reuse_type": reuse_type,
+                "target_stack_match": overlap if target_stack else None,
+            }
+
+        candidates = [enrich(item, "capability") for item in capabilities.get("results", [])[:limit]]
+        ui_candidates = [enrich(item, "ui") for item in ui_assets.get("results", [])[:limit]]
+        return {
+            "status": "ok",
+            "source": "indexed-evidence",
+            "requirement": requirement,
+            "target_stack": target_stack,
+            "candidates": candidates,
+            "ui_candidates": ui_candidates,
+            "reuse_types": sorted({item["reuse_type"] for item in candidates + ui_candidates}) or ["unknown"],
+            "warnings": [
+                "Candidates are evidence-backed leads, not a declaration that a feature can be copied directly; inspect evidence, dependencies, license and tests before implementation.",
+            ],
+        }
 
     def import_screenshot(self, asset_id: str, source_path: Path) -> dict[str, Any]:
         if not source_path.is_file():
             raise FileNotFoundError(source_path)
+        if source_path.suffix.lower() not in SCREENSHOT_EXTENSIONS:
+            return {"status": "invalid_request", "warnings": ["screenshot must be png, jpg, jpeg, webp, or gif"]}
+        requested_asset_id = asset_id
+        asset_id = self._resolve_asset_id(asset_id)
         with connect(self.cfg.db_path) as conn:
             row = conn.execute("SELECT asset_id FROM ui_assets WHERE asset_id=?", (asset_id,)).fetchone()
             if not row:
@@ -546,7 +921,7 @@ class IndexStore:
         with connect(self.cfg.db_path) as conn:
             conn.execute("UPDATE ui_assets SET screenshot_status='available',screenshot_path=?,updated_at=? WHERE asset_id=?", (str(target.relative_to(self.cfg.project_root).as_posix()), utc_now(), asset_id))
             conn.commit()
-        return {"status": "ok", "asset_id": asset_id, "screenshot_path": str(target)}
+        return {"status": "ok", "asset_id": asset_id, "requested_asset_id": requested_asset_id, "screenshot_path": str(target)}
 
     def status(self) -> dict[str, Any]:
         with connect(self.cfg.db_path, readonly=True) as conn:

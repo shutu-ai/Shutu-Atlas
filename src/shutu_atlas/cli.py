@@ -117,19 +117,7 @@ def cmd_suggest_reuse(args: argparse.Namespace) -> int:
     if not store:
         _print({"status": "unavailable", "warnings": ["index not initialized"]})
         return 2
-    limit = min(max(1, args.limit), 3)
-    capability = store.find_capability(args.requirement, limit)
-    ui = store.find_ui(args.requirement, limit)
-    _print({
-        "status": "ok",
-        "source": "indexed-evidence",
-        "requirement": args.requirement,
-        "target_stack": args.target_stack,
-        "candidates": capability.get("results", [])[:3],
-        "ui_candidates": ui.get("results", [])[:3],
-        "reuse_types": ["reuse_direct", "adapt", "visual_reference", "unknown"],
-        "warnings": ["候选是静态证据；实施前请核验依赖、许可证和测试"],
-    })
+    _print(store.suggest_reuse(args.requirement, args.target_stack, args.limit))
     return 0
 
 
@@ -208,4 +196,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

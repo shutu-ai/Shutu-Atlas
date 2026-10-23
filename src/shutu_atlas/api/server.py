@@ -3,7 +3,7 @@ from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from ..config import AtlasConfig
 from ..index.database import IndexStore
@@ -19,9 +19,24 @@ def _json(handler: BaseHTTPRequestHandler, payload: dict, status: int = 200) -> 
     handler.wfile.write(data)
 
 
-def serve_gallery(cfg: AtlasConfig, host: str = "127.0.0.1", port: int = 8765) -> None:
+def _optional_query(query: dict[str, list[str]], key: str) -> str | None:
+    value = query.get(key, [None])[0]
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def create_gallery_server(
+    cfg: AtlasConfig,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    web_root: Path | None = None,
+) -> ThreadingHTTPServer:
+    """Build the read-only Gallery server without starting its loop."""
+
     store = IndexStore(cfg)
-    web_root = cfg.project_root / "web"
+    gallery_web_root = (web_root or (cfg.project_root / "web")).resolve()
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "ShutuAtlasGallery/0.2"
@@ -32,22 +47,37 @@ def serve_gallery(cfg: AtlasConfig, host: str = "127.0.0.1", port: int = 8765) -
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             path = parsed.path
-            query = parse_qs(parsed.query)
+            query = parse_qs(parsed.query, keep_blank_values=True)
             try:
                 if path == "/api/health":
                     _json(self, {"status": "ok", "gallery": "read-only", "store": store.status()})
                 elif path == "/api/status":
                     _json(self, store.status())
                 elif path == "/api/projects":
-                    _json(self, {"status": "ok", "results": store.list_projects(query.get("filter", [None])[0], int(query.get("limit", [50])[0]))})
+                    _json(self, {"status": "ok", "results": store.list_projects(_optional_query(query, "filter"), int(query.get("limit", [50])[0]))})
                 elif path == "/api/search":
-                    _json(self, store.search_code(query.get("q", [""])[0], int(query.get("limit", [20])[0]), query.get("project_id", [None])[0], query.get("language", [None])[0]))
+                    _json(
+                        self,
+                        store.search_code(
+                            _optional_query(query, "q") or "",
+                            int(query.get("limit", [20])[0]),
+                            _optional_query(query, "project_id"),
+                            _optional_query(query, "language"),
+                        ),
+                    )
                 elif path == "/api/ui":
-                    _json(self, store.find_ui(query.get("q", [""])[0], int(query.get("limit", [20])[0]), query.get("project_id", [None])[0]))
+                    _json(
+                        self,
+                        store.find_ui(
+                            _optional_query(query, "q") or "",
+                            int(query.get("limit", [20])[0]),
+                            _optional_query(query, "project_id"),
+                        ),
+                    )
                 elif path.startswith("/api/ui/"):
-                    _json(self, store.ui_detail(path.rsplit("/", 1)[-1]))
+                    _json(self, store.ui_detail(unquote(path.rsplit("/", 1)[-1])))
                 elif path.startswith("/assets/"):
-                    self._serve_asset(path.rsplit("/", 1)[-1])
+                    self._serve_asset(unquote(path.rsplit("/", 1)[-1]))
                 else:
                     self._serve_web(path)
             except (ValueError, KeyError) as exc:
@@ -56,15 +86,20 @@ def serve_gallery(cfg: AtlasConfig, host: str = "127.0.0.1", port: int = 8765) -
                 _json(self, {"status": "error", "warnings": [f"{type(exc).__name__}: {exc}"]}, 500)
 
         def _serve_web(self, path: str) -> None:
-            relative = "index.html" if path in {"", "/"} else path.lstrip("/")
-            target = (web_root / relative).resolve()
-            if web_root.resolve() not in target.parents and target != web_root.resolve():
+            relative = "index.html" if path in {"", "/"} else unquote(path.lstrip("/"))
+            target = (gallery_web_root / relative).resolve()
+            if gallery_web_root not in target.parents and target != gallery_web_root:
                 _json(self, {"status": "denied", "warnings": ["web path escapes root"]}, 403)
                 return
             if not target.is_file():
                 _json(self, {"status": "not_found", "warnings": ["gallery asset not found"]}, 404)
                 return
-            content_types = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml"}
+            content_types = {
+                ".html": "text/html; charset=utf-8",
+                ".js": "text/javascript; charset=utf-8",
+                ".css": "text/css; charset=utf-8",
+                ".svg": "image/svg+xml",
+            }
             data = target.read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", content_types.get(target.suffix.lower(), "application/octet-stream"))
@@ -83,14 +118,26 @@ def serve_gallery(cfg: AtlasConfig, host: str = "127.0.0.1", port: int = 8765) -
             if gallery_root not in target.parents or not target.is_file():
                 _json(self, {"status": "denied", "warnings": ["gallery path is invalid"]}, 403)
                 return
+            content_types = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+                ".gif": "image/gif",
+            }
             data = target.read_bytes()
             self.send_response(200)
-            self.send_header("Content-Type", "image/png" if target.suffix.lower() == ".png" else "image/jpeg")
+            self.send_header("Content-Type", content_types.get(target.suffix.lower(), "application/octet-stream"))
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(data)
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+def serve_gallery(cfg: AtlasConfig, host: str = "127.0.0.1", port: int = 8765) -> None:
+    server = create_gallery_server(cfg, host, port)
     print(f"Shutu-Atlas Gallery: http://{host}:{port}", flush=True)
     try:
         server.serve_forever()
@@ -98,4 +145,3 @@ def serve_gallery(cfg: AtlasConfig, host: str = "127.0.0.1", port: int = 8765) -
         pass
     finally:
         server.server_close()
-

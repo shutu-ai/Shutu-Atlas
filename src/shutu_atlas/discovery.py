@@ -23,9 +23,18 @@ TEXT_EXTENSIONS = {
 SENSITIVE_NAMES = {
     ".env", ".env.local", ".env.production", ".env.development", "id_rsa",
     "credentials.json", "credentials.toml", "secrets.json", "secrets.yaml",
-    "secret.key", "token.txt", "access_token", "client_secret",
+    "secret.key", "token.txt", "access_token", "client_secret", ".npmrc",
+    ".pypirc", ".netrc",
 }
-SENSITIVE_SUFFIXES = {".pem", ".key", ".p12", ".pfx", ".crt", ".cer"}
+SENSITIVE_SUFFIXES = {
+    ".pem", ".key", ".p12", ".pfx", ".crt", ".cer", ".der", ".jks",
+    ".keystore", ".asc", ".gpg",
+}
+SENSITIVE_DIR_NAMES = {".aws", ".ssh", ".gnupg", ".secrets", ".credentials"}
+SENSITIVE_NAME_PARTS = (
+    "secret", "credential", "token", "password", "passwd", "api-key", "api_key",
+    "apikey", "private-key", "private_key",
+)
 
 
 @dataclass(slots=True)
@@ -188,19 +197,69 @@ def discover_projects(cfg: AtlasConfig) -> list[ProjectRecord]:
 
 
 def is_sensitive(path: Path) -> bool:
+    """Return whether a path is outside the shared readable-file policy.
+
+    This predicate is deliberately used by discovery, ripgrep and source reads.
+    It is conservative for hidden credential-like names while leaving ordinary
+    hidden project files such as ``.eslintrc`` available to the index.
+    """
+
+    folded_parts = [part.casefold() for part in path.parts]
     name = path.name.casefold()
-    return name in {n.casefold() for n in SENSITIVE_NAMES} or path.suffix.casefold() in SENSITIVE_SUFFIXES or name.startswith(".env")
+    if name in {n.casefold() for n in SENSITIVE_NAMES}:
+        return True
+    if name.startswith(".env") or path.suffix.casefold() in SENSITIVE_SUFFIXES:
+        return True
+    if any(part in SENSITIVE_DIR_NAMES for part in folded_parts):
+        return True
+    return name.startswith(".") and any(part in name for part in SENSITIVE_NAME_PARTS)
 
 
 def safe_source_path(project_root: Path, relative_path: str) -> Path:
-    if not relative_path or Path(relative_path).is_absolute() or ".." in Path(relative_path).parts:
+    """Resolve an indexed relative path without following links or escaping.
+
+    Checking the unresolved path before calling ``resolve`` is important on
+    Windows: resolving first would turn a symlink into its target and make a
+    later ``is_symlink`` check ineffective.
+    """
+
+    relative = Path(relative_path)
+    if not relative_path or relative.is_absolute() or ".." in relative.parts:
         raise ValueError("relative path required")
-    target = (project_root / relative_path).resolve()
     base = project_root.resolve()
+    raw_target = base / relative
+    current = base
+    for part in relative.parts:
+        current = current / part
+        if current != base and is_reparse_point(current):
+            raise ValueError("symlink source is not readable")
+    target = raw_target.resolve()
     if target != base and base not in target.parents:
         raise ValueError("path escapes project root")
-    if target.is_symlink():
-        raise ValueError("symlink source is not readable")
+    return target
+
+
+def allowed_source_path(project_root: Path, relative_path: str, cfg: AtlasConfig) -> Path:
+    """Return a path only when it belongs to the indexable file set.
+
+    ``iter_project_files`` and all indexed source consumers call this helper so
+    a file cannot be searchable or readable merely because ripgrep can see it.
+    """
+
+    relative = Path(relative_path)
+    if any(part in cfg.excluded_dirs for part in relative.parts):
+        raise ValueError("path is in an excluded directory")
+    raw_target = project_root.resolve() / relative
+    if is_sensitive(raw_target) or raw_target.suffix.lower() not in TEXT_EXTENSIONS:
+        raise ValueError("path is not in the readable file set")
+    target = safe_source_path(project_root, relative_path)
+    if not target.is_file():
+        raise ValueError("source file is not readable")
+    try:
+        if target.stat().st_size > cfg.limits.max_file_bytes:
+            raise ValueError("source file exceeds the configured size limit")
+    except OSError as exc:
+        raise ValueError("source file is not readable") from exc
     return target
 
 
@@ -209,19 +268,20 @@ def iter_project_files(project: ProjectRecord, cfg: AtlasConfig) -> Iterator[tup
     count = 0
     for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
         current_path = Path(current)
-        dirs[:] = [d for d in dirs if d not in cfg.excluded_dirs and not is_reparse_point(current_path / d)]
+        dirs[:] = [
+            d for d in dirs
+            if d not in cfg.excluded_dirs
+            and d.casefold() not in SENSITIVE_DIR_NAMES
+            and not is_reparse_point(current_path / d)
+        ]
         for name in files:
             path = current_path / name
-            if is_sensitive(path) or is_reparse_point(path) or path.suffix.lower() not in TEXT_EXTENSIONS:
-                continue
             try:
-                if path.stat().st_size > cfg.limits.max_file_bytes:
-                    continue
                 relative = path.relative_to(root).as_posix()
-                safe_source_path(root, relative)
+                allowed = allowed_source_path(root, relative, cfg)
             except (OSError, ValueError):
                 continue
-            yield path, relative
+            yield allowed, relative
             count += 1
             if count >= cfg.limits.max_files_per_project:
                 return

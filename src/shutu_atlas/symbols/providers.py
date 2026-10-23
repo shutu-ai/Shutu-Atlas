@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ast
 import hashlib
 import asyncio
 import json
@@ -139,14 +140,33 @@ class SerenaProvider:
             "PATH": os.environ.get("PATH", ""),
             "SERENA_HOME": str((self.cfg.serena_dir / "_home").resolve()),
             "SERENA_USAGE_REPORTING": "false",
+            # Keep Serena/uv bootstrap state inside the Hub-owned working area.
+            "UV_CACHE_DIR": str((self.cfg.serena_dir / "_uv-cache").resolve()),
         }
         Path(env["SERENA_HOME"]).mkdir(parents=True, exist_ok=True)
+        Path(env["UV_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+        tool_timeout = max(30.0, self.cfg.limits.command_timeout_seconds)
         server = StdioServerParameters(
             command=self.executable,
-            args=["start-mcp-server", "--project", str(mirror_root), "--context", "codex", "--open-web-dashboard", "false"],
+            # Serena defaults to its REPL interface in the installed runtime.  Request the
+            # official one-tool-per-operation interface so symbolic read tools are available;
+            # this adapter calls only find_symbol/find_referencing_symbols below.
+            args=[
+                "start-mcp-server",
+                "--project",
+                str(mirror_root),
+                "--context",
+                "codex",
+                "--agent-interface",
+                "tools",
+                "--tool-timeout",
+                str(tool_timeout),
+                "--open-web-dashboard",
+                "false",
+            ],
             env=env,
         )
-        async with Client(server, read_timeout_seconds=self.cfg.limits.command_timeout_seconds) as client:
+        async with Client(server, read_timeout_seconds=tool_timeout) as client:
             tools = await client.list_tools()
             tool_names = {tool.name for tool in tools.tools}
             find_name = "find_symbol" if "find_symbol" in tool_names else next((n for n in tool_names if n.endswith("find_symbol")), None)
@@ -228,16 +248,21 @@ def _serena_payload(result: Any) -> list[dict[str, Any]]:
     if raw is None:
         texts = [getattr(block, "text", "") for block in getattr(result, "content", [])]
         raw = next((text for text in texts if text), "")
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except json.JSONDecodeError:
-            return []
     if isinstance(raw, dict):
         for key in ("symbols", "results", "result"):
             if key in raw:
                 raw = raw[key]
                 break
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            # Serena 2.1.0 renders symbolic results as a Python-literal string
+            # (single-quoted dicts) through MCP, while older versions returned JSON.
+            try:
+                raw = ast.literal_eval(raw)
+            except (SyntaxError, ValueError):
+                return []
     if isinstance(raw, dict):
         raw = [raw]
     return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []

@@ -21,7 +21,7 @@ if _optional_deps.is_dir():
 @pytest.fixture
 def fixture_root() -> Path:
     source = Path(__file__).parent / "fixtures"
-    root = Path(__file__).parent / ".test-work" / uuid.uuid4().hex / "sources"
+    root = Path(__file__).parents[1] / ".local" / "test-work" / uuid.uuid4().hex / "sources"
     root.mkdir(parents=True)
     for name in ("fixture-python", "fixture-ts-vue", "fixture-secrets", "fixture-multi-repo", "fixture-mcp"):
         shutil.copytree(source / name, root / name)
@@ -31,7 +31,7 @@ def fixture_root() -> Path:
 
 @pytest.fixture
 def test_config(fixture_root: Path) -> AtlasConfig:
-    hub = fixture_root.parent.parent / "hub"
+    hub = fixture_root.parent / "hub"
     return AtlasConfig(
         project_root=hub,
         roots=[fixture_root],

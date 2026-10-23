@@ -1,5 +1,7 @@
 # Optional, isolated verification dependencies.  The base package remains
 # stdlib-only and keeps a truthful compatibility transport when these are
 # unavailable.
-mcp[cli]==2.3.0
+mcp[cli]==2.2.0
 serena-agent==2.1.0
+# Serena's official Python language-server workflow invokes uv/uvx.
+uv==0.13.5

@@ -1,25 +1,69 @@
-# MCP 与 Skill 集成
+# MCP and local-project-reuse Skill integration
 
-## MCP stdio
+## Read-only MCP stdio
 
-本项目提供只读 stdio 服务：安装 `requirements-integrations.txt` 中的官方 MCP Python SDK 后，使用 SDK v2 low-level `Server`/`stdio_server`；未安装时自动使用依赖为零的兼容 JSON-RPC transport：
+Shutu-Atlas exposes a read-only stdio service. It prefers the official MCP
+Python SDK when that optional dependency is available and otherwise keeps the
+dependency-free JSON-RPC compatibility transport.
 
 ```powershell
 atlas mcp serve --transport stdio
 ```
 
-服务 stdout 只输出协议消息；日志和非法输入错误写 stderr。工具清单见 README 和 `src/shutu_atlas/mcp_server/server.py`。当前环境没有官方 Python MCP SDK，因此 `atlas_health` 报告 `mcp_sdk.available=false`；这不是官方 SDK 集成 PASS。
+The server exposes query-only tools: project listing, capability/UI search,
+code/symbol/source lookup, reuse suggestions, and health. It does not expose
+index refresh, shell execution, Git writes, source writes, or Gallery writes.
 
-官方依赖安装与校验：
+The verified integration lock is:
 
-```powershell
-.\scripts\install.ps1 -WithIntegrations
-py -m pytest -q tests/test_mcp_sdk_optional.py
+```text
+mcp[cli]==2.2.0
+serena-agent==2.1.0
+uv==0.13.5
 ```
 
-当前锁定 `mcp[cli]==2.3.0`、`serena-agent==2.1.0`；本机 PyPI 连接被 WinError 10013 拒绝，故官方客户端测试保持 `SKIPPED/BLOCKED_ENV`。
+`mcp==2.2.0` is intentional: Serena 2.1.0 declares that exact MCP version.
+`uv` is required by Serena's official Python language-server bootstrap.
 
-Codex/OpenCode 的配置应由用户按实际版本合并，不能自动覆盖已有同名服务器。示例（概念格式，执行前检查客户端版本）：
+The isolated verification environment is kept under `.local/integration-venv`.
+It is not the user's default Python environment and does not write source
+repositories or user Codex/OpenCode configuration.
+
+## Evidence commands
+
+```powershell
+python -m pytest -q
+$env:PATH = "D:\dev-projects\Shutu-Atlas\.local\integration-venv\Scripts;$env:PATH"
+python -m pytest -q tests/test_mcp_sdk_optional.py tests/test_serena_optional.py tests/test_skill_e2e.py
+python -m pytest -q tests/test_gallery_frontend.py
+```
+
+The elevated integration run used the official `mcp.Client` stdio client,
+listed the real Atlas tools, called `atlas_health`, queried a real indexed
+fixture, fetched a bounded source range, and ran the disposable target project
+created by `tests/test_skill_e2e.py`. Serena was started against a Hub-owned
+mirror with `SERENA_HOME`, `UV_CACHE_DIR`, and all integration state under
+`.local`; no source project received a `.serena` directory.
+
+## Skill workflow
+
+`skills/local-project-reuse/SKILL.md` requires this sequence:
+
+1. call `atlas_health`;
+2. query only the relevant capability/UI candidates;
+3. use code/symbol search to identify evidence and line ranges;
+4. read a bounded source range and inspect stack/dependency/risk evidence;
+5. classify the result as `reuse_direct`, `adapt`, `visual_reference`,
+   `not_recommended`, or `unknown`;
+6. change only the explicitly selected new project and run its test.
+
+The automated E2E test follows that sequence against `fixture-python` and then
+runs a minimal `resume_from_checkpoint` feature in a fresh disposable target.
+
+## Client configuration
+
+Users may merge the following server entry into their client configuration
+after backing it up. The project never overwrites an existing user config.
 
 ```json
 {
@@ -33,21 +77,6 @@ Codex/OpenCode 的配置应由用户按实际版本合并，不能自动覆盖�
 }
 ```
 
-不要把这个示例直接写入用户配置；先备份、查重并明确确认。项目脚本只负责检查和安装，不负责自动合并。
-
-## Skill
-
-源文件为 `skills/local-project-reuse/SKILL.md`。安全预览：
-
-```powershell
-.\scripts\install-skill.ps1
-```
-
-安装前确认后：
-
-```powershell
-.\scripts\install-skill.ps1 -Install -DryRun:$false
-```
-
-本次环境没有执行用户级安装，也没有声称 OpenCode 已实测加载；OpenCode 结果应保持 `UNVERIFIED`。
-
+OpenCode remains `UNVERIFIED`: the CLI was present, but the environment
+rejected its log-file open with `EPERM`, so no authenticated client session or
+user-level configuration change was attempted.
