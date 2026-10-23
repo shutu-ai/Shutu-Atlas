@@ -5,7 +5,7 @@
 | ID | 当前状态 | 证据/命令 |
 | --- | --- | --- |
 | A01 源项目零改写 | `PASS_WITH_SCOPE` | M0 与索引后两次只读快照的 12 个 Git 项目 HEAD/dirty 完全一致；未创建源仓库 `.serena`。15 个普通目录未做完整内容哈希，范围限制已记录。 |
-| A02 多项目发现 | `PASS` | `atlas scan --root D:\dev-projects --dry-run` 实测发现 39 个外部候选（含嵌套源码项目），索引实际覆盖 3 个真实 Git 项目、606 个文件，技术栈含 Python/JavaScript/TypeScript/Go。 |
+| A02 多项目发现 | `PASS` | `atlas scan --root D:\dev-projects --dry-run` 实测发现 39 个外部候选（含嵌套源码项目），索引实际覆盖 5 个真实 Git 项目、1,580 个文件，技术栈含 Python/JavaScript/TypeScript/Go。 |
 | A03 全文与能力查询 | `PASS` | FTS5 + ripgrep 实测查询 `mcp`、`任务重启恢复`、`趋势图`；返回真实项目、文件、行号、Git HEAD/dirty 和证据片段；`find-symbol main` 明确返回 static fallback。 |
 | A04 增量更新 | `PASS` | `tests/test_index.py::test_incremental_change_and_remove` 通过；哈希/mtime、增删清理和 `--changed-only` 实测，真实索引 run 2 为 0 个错误。 |
 | A05 Serena | `BLOCKED_ENV` | 本机 `serena` 不在 PATH；静态 fallback 和镜像边界已实现，真实 Serena integration test 未运行。 |

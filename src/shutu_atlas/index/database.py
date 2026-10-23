@@ -210,18 +210,24 @@ class IndexStore:
             run_id = cur.lastrowid
             conn.commit()
             counts = {"projects_seen": 0, "files_indexed": 0, "errors": 0}
-            for project in projects:
-                if project.excluded:
-                    continue
-                counts["projects_seen"] += 1
-                try:
-                    counts["files_indexed"] += self._index_project(conn, project, changed_only)
-                    conn.commit()
-                except Exception as exc:  # keep other projects independently indexable
-                    conn.rollback()
-                    counts["errors"] += 1
-                    conn.execute("INSERT INTO index_errors(run_id,project_id,error_type,message,created_at) VALUES(?,?,?,?,?)", (run_id, project.project_id, type(exc).__name__, str(exc)[:1000], utc_now()))
-                    conn.commit()
+            try:
+                for project in projects:
+                    if project.excluded:
+                        continue
+                    counts["projects_seen"] += 1
+                    try:
+                        counts["files_indexed"] += self._index_project(conn, project, changed_only)
+                        conn.commit()
+                    except Exception as exc:  # keep other projects independently indexable
+                        conn.rollback()
+                        counts["errors"] += 1
+                        conn.execute("INSERT INTO index_errors(run_id,project_id,relative_path,error_type,message,created_at) VALUES(?,?,?,?,?,?)", (run_id, project.project_id, None, type(exc).__name__, str(exc)[:1000], utc_now()))
+                        conn.commit()
+            except KeyboardInterrupt:
+                conn.rollback()
+                conn.execute("UPDATE index_runs SET finished_at=?,projects_seen=?,files_indexed=?,errors=?,status=? WHERE run_id=?", (utc_now(), counts["projects_seen"], counts["files_indexed"], counts["errors"], "interrupted", run_id))
+                conn.commit()
+                raise
             conn.execute("UPDATE index_runs SET finished_at=?,projects_seen=?,files_indexed=?,errors=?,status=? WHERE run_id=?", (utc_now(), counts["projects_seen"], counts["files_indexed"], counts["errors"], "ok" if not counts["errors"] else "partial", run_id))
             conn.commit()
             return {"run_id": run_id, **counts, "status": "ok" if not counts["errors"] else "partial"}
