@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sys
 import threading
 from typing import Any, Protocol
 
@@ -80,6 +81,52 @@ class FallbackProvider:
         return {"status": "DEGRADED", "provider": "fallback-static", "reason": "Serena executable is unavailable"}
 
 
+def _runtime_tool_dirs() -> list[Path]:
+    """Return the executable directory belonging to the active Python runtime.
+
+    Codex may launch Atlas with an absolute venv Python while inheriting a PATH
+    that does not contain that venv's Scripts directory.  Resolving sibling
+    console scripts keeps the daily MCP process self-contained without editing
+    user-level PATH or configuration.
+    """
+
+    try:
+        return [Path(sys.executable).resolve().parent]
+    except OSError:
+        return []
+
+
+def resolve_runtime_executable(name: str) -> str | None:
+    """Resolve a tool from explicit env, PATH, or the active Python venv."""
+
+    env_name = f"SHUTU_ATLAS_{name.upper()}_EXECUTABLE"
+    configured = os.environ.get(env_name)
+    if configured:
+        candidate = Path(configured).expanduser()
+        if candidate.is_file():
+            return str(candidate.resolve())
+    for directory in _runtime_tool_dirs():
+        for filename in (name, f"{name}.exe"):
+            candidate = directory / filename
+            if candidate.is_file():
+                return str(candidate)
+    found = shutil.which(name)
+    if found:
+        return str(Path(found).resolve())
+    return None
+
+
+def runtime_tool_path(*executables: str | None) -> str:
+    """Build a child PATH with the active venv and resolved tools first."""
+
+    directories: list[str] = [str(path) for path in _runtime_tool_dirs()]
+    directories.extend(str(Path(path).resolve().parent) for path in executables if path)
+    inherited = os.environ.get("PATH", "")
+    if inherited:
+        directories.extend(inherited.split(os.pathsep))
+    return os.pathsep.join(dict.fromkeys(path for path in directories if path))
+
+
 class SerenaProvider:
     """Capability boundary for Serena.
 
@@ -90,14 +137,21 @@ class SerenaProvider:
     def __init__(self, cfg: AtlasConfig, fallback: FallbackProvider):
         self.cfg = cfg
         self.fallback = fallback
-        self.executable = shutil.which("serena")
+        self.executable = resolve_runtime_executable("serena")
+        self.uv_executable = resolve_runtime_executable("uv")
+        self.uvx_executable = resolve_runtime_executable("uvx")
 
     def health(self) -> dict[str, Any]:
+        tooling = {
+            "serena": self.executable,
+            "uv": self.uv_executable,
+            "uvx": self.uvx_executable,
+        }
         if not self.executable:
-            return {"status": "BLOCKED_ENV", "provider": "serena", "available": False, "reason": "serena executable not found"}
+            return {"status": "BLOCKED_ENV", "provider": "serena", "available": False, "tooling": tooling, "reason": "serena executable not found"}
         if not _mcp_client_available():
-            return {"status": "BLOCKED_ENV", "provider": "serena", "available": False, "executable": self.executable, "reason": "official MCP Python SDK is unavailable"}
-        return {"status": "AVAILABLE_UNVERIFIED", "provider": "serena", "available": True, "executable": self.executable, "reason": "isolated Serena stdio adapter is ready for an opted-in integration call"}
+            return {"status": "BLOCKED_ENV", "provider": "serena", "available": False, "tooling": tooling, "reason": "official MCP Python SDK is unavailable"}
+        return {"status": "AVAILABLE_UNVERIFIED", "provider": "serena", "available": True, "tooling": tooling, "reason": "isolated Serena stdio adapter is ready for an opted-in integration call"}
 
     def find_symbol(self, name: str, project_id: str | None = None, kind: str | None = None) -> dict[str, Any]:
         health = self.health()
@@ -137,7 +191,7 @@ class SerenaProvider:
         from mcp import Client, StdioServerParameters
 
         env = {
-            "PATH": os.environ.get("PATH", ""),
+            "PATH": runtime_tool_path(self.executable, self.uv_executable, self.uvx_executable),
             "SERENA_HOME": str((self.cfg.serena_dir / "_home").resolve()),
             "SERENA_USAGE_REPORTING": "false",
             # Keep Serena/uv bootstrap state inside the Hub-owned working area.

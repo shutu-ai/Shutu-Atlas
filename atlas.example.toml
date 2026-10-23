@@ -12,7 +12,9 @@ excluded_dirs = [".git", ".local", "node_modules", ".venv", "dist", "build", "co
 
 [limits]
 max_file_bytes = 512000
-max_files_per_project = 20000
+# The current D:\dev-projects inventory contains two legitimate source/UI
+# projects with 23k–24k eligible files. Keep the cap explicit and bounded.
+max_files_per_project = 30000
 max_results = 50
 max_snippet_lines = 12
 max_chars = 8000

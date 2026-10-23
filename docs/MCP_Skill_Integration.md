@@ -27,7 +27,10 @@ uv==0.13.5
 
 The isolated verification environment is kept under `.local/integration-venv`.
 It is not the user's default Python environment and does not write source
-repositories or user Codex/OpenCode configuration.
+repositories or user Codex/OpenCode configuration. The Atlas MCP process now
+resolves `serena.exe`, `uv.exe`, and `uvx.exe` beside its active Python before
+falling back to PATH, and passes that venv directory only to the Hub-owned
+Serena child process.
 
 ## Evidence commands
 
@@ -65,17 +68,19 @@ runs a minimal `resume_from_checkpoint` feature in a fresh disposable target.
 Users may merge the following server entry into their client configuration
 after backing it up. The project never overwrites an existing user config.
 
-```json
-{
-  "mcpServers": {
-    "shutu-atlas": {
-      "command": "D:/dev-projects/Shutu-Atlas/.venv/Scripts/python.exe",
-      "args": ["-m", "shutu_atlas.cli", "mcp", "serve", "--transport", "stdio"],
-      "cwd": "D:/dev-projects/Shutu-Atlas"
-    }
-  }
-}
+```toml
+[mcp_servers.shutu-atlas]
+command = "D:/dev-projects/Shutu-Atlas/.local/integration-venv/Scripts/python.exe"
+args = ["-m", "shutu_atlas.cli", "--config", "D:/dev-projects/Shutu-Atlas/atlas.toml", "mcp", "serve", "--transport", "stdio"]
+
+[mcp_servers.shutu-atlas.env]
+PYTHONPATH = "D:/dev-projects/Shutu-Atlas/src"
 ```
+
+This is a mergeable Codex `config.toml` entry. Back up the user file first and
+preserve all other `[mcp_servers.*]` sections. The absolute Python path is
+intentional: it makes the official SDK and Serena selection reproducible in a
+new conversation without relying on a one-shot PowerShell PATH change.
 
 OpenCode remains `UNVERIFIED`: the CLI was present, but the environment
 rejected its log-file open with `EPERM`, so no authenticated client session or

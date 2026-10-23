@@ -16,14 +16,14 @@ excluded from source discovery.
 
 ## Optional official integrations
 
-Use an explicitly approved isolated environment when verifying Serena and the
-official MCP SDK:
+Use the Hub-owned isolated environment when verifying Serena and the official
+MCP SDK. The paths below are project-local; they do not modify system Python:
 
 ```powershell
-python -m venv .local\integration-venv
-.local\integration-venv\Scripts\python.exe -m pip install -r requirements-integrations.txt
-$env:PATH = "D:\dev-projects\Shutu-Atlas\.local\integration-venv\Scripts;$env:PATH"
-python -m pytest -q tests/test_mcp_sdk_optional.py tests/test_serena_optional.py tests/test_skill_e2e.py
+$atlasPython = (Resolve-Path .local\integration-venv\Scripts\python.exe).Path
+& $atlasPython -m pip install -r requirements-integrations.txt
+$env:PATH = "$(Split-Path $atlasPython);$env:PATH"
+& $atlasPython -m pytest -q tests/test_mcp_sdk_optional.py tests/test_serena_optional.py tests/test_skill_e2e.py
 ```
 
 The pinned compatibility set is `mcp[cli]==2.2.0`,
@@ -95,10 +95,14 @@ atlas index --changed-only --retry-project PROJECT_NAME_OR_ID
 atlas status
 ```
 
-`partial` is a real terminal status. The default
-`max_files_per_project = 20000` is a safety limit; an oversized project is
-recorded with its actual eligible file count, bytes, skipped count, and
-`FileLimitReached` error. It must not be reported as complete.
+`partial` is a real terminal status. The checked-in
+`atlas.example.toml` and the local V2 `atlas.toml` set
+`max_files_per_project = 30000` because the current inventory contains two
+legitimate source/UI projects with 23k–24k eligible files. The Python default
+remains a conservative 20,000 when no config file is supplied. Any project
+that exceeds the active limit is recorded with its actual eligible file count,
+bytes, skipped count, and `FileLimitReached` error; it must not be reported as
+complete.
 
 Cache/generated directories such as `.codegraph`, `.go-cache`,
 `.go-mod-cache`, `.deploy-staging*`, and `pytest-cache-files-*` are excluded

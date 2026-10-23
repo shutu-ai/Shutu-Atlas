@@ -14,7 +14,7 @@ from .config import AtlasConfig, load_config
 from .discovery import discover_projects
 from .index.database import IndexStore
 from .mcp_server.server import run_stdio
-from .symbols.providers import FallbackProvider, SerenaProvider
+from .symbols.providers import FallbackProvider, SerenaProvider, resolve_runtime_executable
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -70,8 +70,8 @@ def cmd_index(args: argparse.Namespace) -> int:
 def cmd_doctor(args: argparse.Namespace) -> int:
     cfg = _config(args)
     tools = {}
-    for name in ("git", "rg", "uv", "node", "npm", "playwright", "serena", "codex", "opencode"):
-        tools[name] = shutil.which(name)
+    for name in ("git", "rg", "uv", "uvx", "node", "npm", "playwright", "serena", "codex", "opencode"):
+        tools[name] = resolve_runtime_executable(name) if name in {"uv", "uvx", "serena"} else shutil.which(name)
     sdk = importlib.util.find_spec("mcp")
     payload = {"status": "ok", "version": __version__, "platform": platform.platform(), "python": sys.version.split()[0], "tools": tools, "python_mcp_sdk": bool(sdk), "sqlite_fts5": _fts5_available(), "config": {"project_root": str(cfg.project_root), "roots": [str(p) for p in cfg.roots], "db": str(cfg.db_path)}, "notes": []}
     if not tools["serena"]:

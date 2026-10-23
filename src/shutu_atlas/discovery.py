@@ -43,7 +43,7 @@ SENSITIVE_NAME_PARTS = (
 def _is_excluded_directory_name(name: str, cfg: AtlasConfig) -> bool:
     return (
         name in cfg.excluded_dirs
-        or name.startswith(".deploy-staging-")
+        or name.startswith(".deploy-staging")
         or name.startswith("pytest-cache-files-")
     )
 

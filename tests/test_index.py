@@ -6,7 +6,7 @@ import shutil
 
 import pytest
 
-from shutu_atlas.discovery import discover_projects
+from shutu_atlas.discovery import _is_excluded_directory_name, discover_projects
 from shutu_atlas.index import database as database_module
 from shutu_atlas.index.database import IndexStore, connect, utc_now
 
@@ -25,6 +25,11 @@ def test_discovery_and_index_evidence(test_config):
     ui = store.find_ui("dashboard KPI")
     assert ui["results"]
     assert all(item["screenshot_status"] == "unavailable" for item in ui["results"])
+
+
+def test_generated_directory_prefixes_are_excluded(test_config):
+    for name in (".deploy-staging", ".deploy-staging-20261023", ".deploy-staging-temp", "pytest-cache-files-a0ot86lp"):
+        assert _is_excluded_directory_name(name, test_config)
 
 
 def test_hub_capability_review_survives_incremental_refresh(test_config):
