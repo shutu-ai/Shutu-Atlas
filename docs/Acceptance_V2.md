@@ -134,6 +134,9 @@ Use `--force-hash` when same-size/same-mtime rewrites must be detected. Use
 
 ## Git handoff
 
-The final implementation and evidence changes are committed and pushed after
-the verification pass. The final commit hash is recorded here immediately
-before handoff.
+Implementation commit: `98d37c66305429b8ef41e00e342fbaebecb88eda`.
+
+The local implementation/evidence commit is complete. Repeated `git push
+origin main` attempts all failed before contacting GitHub because the
+environment could not connect to `github.com:443`; the branch is currently
+ahead of `origin/main` by two commits.
