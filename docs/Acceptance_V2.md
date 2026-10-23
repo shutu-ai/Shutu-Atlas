@@ -113,9 +113,10 @@ but it is not a full-workspace coverage claim.
 
 ## Git handoff
 
-Final commit: `PENDING_COMMIT`
+Implementation commit: `8f925eb9023169c23220edea7a0b4d3b47779d83`
 
 Only `D:\dev-projects\Shutu-Atlas` and its test fixtures were changed. No
 reference source project was edited, built, migrated, or used as a write
-target. The final commit hash will replace `PENDING_COMMIT` after the report
-and code are committed.
+The implementation commit contains the code, tests, fixtures, integration
+requirements, and this acceptance report. A follow-up documentation commit
+will record the final report reference.
