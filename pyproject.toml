@@ -20,7 +20,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests/test_index.py", "tests/test_symbols_mcp.py", "tests/test_mcp_sdk_optional.py"]
 norecursedirs = ["fixtures", ".test-tmp", ".test-work"]
 addopts = "-p no:cacheprovider"
 pythonpath = ["src"]

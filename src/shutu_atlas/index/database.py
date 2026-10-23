@@ -154,14 +154,15 @@ def extract_symbols(text: str, language: str) -> list[dict[str, Any]]:
     return result
 
 
-def detect_capabilities(text: str) -> list[dict[str, Any]]:
-    folded = text.casefold()
+def detect_capabilities(text: str, language: str = "") -> list[dict[str, Any]]:
     lines = text.splitlines()
     results: list[dict[str, Any]] = []
     for name, label, needles in CAPABILITY_RULES:
         hits = [i for i, line in enumerate(lines, 1) if any(needle.casefold() in line.casefold() for needle in needles)]
         if hits:
-            status = "verified" if len(hits) >= 2 and any("test" in line.casefold() or "assert" in line.casefold() for line in lines) else "inferred"
+            # Static text is evidence of a candidate, never proof of the full runtime capability.
+            # Verification belongs to an explicit integration/acceptance result, not a keyword heuristic.
+            status = "inferred"
             results.append({"name": name, "label": label, "status": status, "line": hits[0], "snippet": _snippet(lines, hits[0]), "reason": f"关键词命中: {', '.join(needles[:3])}"})
     return results
 
@@ -247,8 +248,8 @@ class IndexStore:
             conn.execute("DELETE FROM symbols WHERE file_id=?", (file_id,))
             conn.executemany("INSERT INTO symbols(file_id,name,kind,start_line,end_line,signature,source) VALUES(?,?,?,?,?,?,?)", [(file_id, s["name"], s["kind"], s["start_line"], s["end_line"], s["signature"], s["source"]) for s in extract_symbols(text, language)])
             conn.execute("DELETE FROM capability_evidence WHERE file_id=?", (file_id,))
-            for cap in detect_capabilities(text):
-                conn.execute("INSERT INTO capabilities(project_id,name,label,status,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(project_id,name) DO UPDATE SET label=excluded.label,status=CASE WHEN capabilities.status='verified' THEN 'verified' ELSE excluded.status END,updated_at=excluded.updated_at", (project.project_id, cap["name"], cap["label"], cap["status"], now))
+            for cap in detect_capabilities(text, language):
+                conn.execute("INSERT INTO capabilities(project_id,name,label,status,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(project_id,name) DO UPDATE SET label=excluded.label,status=excluded.status,updated_at=excluded.updated_at", (project.project_id, cap["name"], cap["label"], cap["status"], now))
                 cap_id = conn.execute("SELECT capability_id FROM capabilities WHERE project_id=? AND name=?", (project.project_id, cap["name"])).fetchone()[0]
                 conn.execute("INSERT INTO capability_evidence(capability_id,file_id,start_line,end_line,snippet,reason) VALUES(?,?,?,?,?,?)", (cap_id, file_id, cap["line"], cap["line"], cap["snippet"], cap["reason"]))
             conn.execute("DELETE FROM ui_source_links WHERE file_id=?", (file_id,))
@@ -343,7 +344,7 @@ class IndexStore:
             if project_filter:
                 conditions.append("(p.name LIKE ? OR p.project_id=?)")
                 params.extend([f"%{project_filter}%", project_filter])
-            rows = conn.execute(f"SELECT c.name,c.label,c.status,p.project_id,p.name AS project_name,p.path,e.file_id,f.relative_path,e.start_line,e.end_line,e.snippet,e.reason FROM capabilities c JOIN projects p ON p.project_id=c.project_id JOIN capability_evidence e ON e.capability_id=c.capability_id JOIN files f ON f.file_id=e.file_id WHERE {' AND '.join(conditions)} ORDER BY CASE c.status WHEN 'verified' THEN 0 WHEN 'inferred' THEN 1 ELSE 2 END, p.name LIMIT ?", (*params, limit)).fetchall()
+            rows = conn.execute(f"SELECT c.name,c.label,c.status,p.project_id,p.name AS project_name,p.path,e.file_id,f.language,f.relative_path,e.start_line,e.end_line,e.snippet,e.reason FROM capabilities c JOIN projects p ON p.project_id=c.project_id JOIN capability_evidence e ON e.capability_id=c.capability_id JOIN files f ON f.file_id=e.file_id WHERE {' AND '.join(conditions)} ORDER BY CASE c.status WHEN 'verified' THEN 0 WHEN 'inferred' THEN 1 ELSE 2 END, CASE WHEN f.language IN ('Markdown','JSON','TOML','Text') THEN 1 ELSE 0 END, p.name LIMIT ?", (*params, limit)).fetchall()
         return {"status": "ok", "query": query, "terms": terms, "results": [dict(row) for row in rows], "warnings": []}
 
     def find_symbols(self, name: str, project_id: str | None = None, kind: str | None = None, limit: int = 20) -> dict[str, Any]:
