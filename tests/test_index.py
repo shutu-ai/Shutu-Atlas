@@ -7,6 +7,7 @@ import shutil
 import pytest
 
 from shutu_atlas.discovery import discover_projects
+from shutu_atlas.index import database as database_module
 from shutu_atlas.index.database import IndexStore, connect, utc_now
 
 
@@ -97,6 +98,107 @@ def test_incremental_change_and_remove(test_config, fixture_root):
     python_file.unlink()
     store.index(discover_projects(test_config), changed_only=True)
     assert not store.search_code("new_incremental_symbol")["results"]
+
+
+def test_rename_is_reconciled_by_incremental_refresh(test_config, fixture_root):
+    projects = discover_projects(test_config)
+    store = IndexStore(test_config)
+    store.index(projects)
+    source = fixture_root / "fixture-python" / "app" / "tasks.py"
+    renamed = source.with_name("tasks_renamed.py")
+    source.rename(renamed)
+    try:
+        result = store.index(discover_projects(test_config), changed_only=True)
+        assert result["changed_files"] >= 1
+        matches = store.search_code("recover_after_restart", 20)["results"]
+        assert any(item["relative_path"] == "app/tasks_renamed.py" for item in matches)
+        assert all(item["relative_path"] != "app/tasks.py" for item in matches)
+    finally:
+        renamed.rename(source)
+
+
+def test_stat_fast_path_and_force_hash_difference(test_config, fixture_root, monkeypatch):
+    projects = discover_projects(test_config)
+    store = IndexStore(test_config)
+    store.index(projects)
+    source = fixture_root / "fixture-python" / "app" / "tasks.py"
+    original_bytes = source.read_bytes()
+    original_stat = source.stat()
+    calls: list[Path] = []
+    original_hash = database_module._sha256
+
+    def tracked_hash(path: Path, metrics=None):
+        calls.append(path)
+        return original_hash(path, metrics)
+
+    monkeypatch.setattr(database_module, "_sha256", tracked_hash)
+    try:
+        source.write_bytes(original_bytes.replace(b"recover_after_restart", b"restore_after_restart"))
+        os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        ordinary = store.index(discover_projects(test_config), changed_only=True)
+        assert ordinary["hash_mode"] == "stat"
+        assert ordinary["changed_files"] == 0
+        assert calls == []
+        with database_module.connect(test_config.db_path, readonly=True) as conn:
+            row = conn.execute(
+                "SELECT content FROM fts_content WHERE relative_path='app/tasks.py'"
+            ).fetchone()
+            assert row is not None
+            assert "recover_after_restart" in row["content"]
+            assert "restore_after_restart" not in row["content"]
+
+        strong = store.index(discover_projects(test_config), changed_only=True, force_hash=True)
+        assert strong["hash_mode"] == "force-hash"
+        assert calls
+        assert strong["changed_files"] >= 1
+        with database_module.connect(test_config.db_path, readonly=True) as conn:
+            row = conn.execute(
+                "SELECT content FROM fts_content WHERE relative_path='app/tasks.py'"
+            ).fetchone()
+            assert row is not None
+            assert "restore_after_restart" in row["content"]
+    finally:
+        source.write_bytes(original_bytes)
+        os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+
+def test_index_metrics_record_each_project_and_stage(test_config):
+    projects = discover_projects(test_config)
+    result = IndexStore(test_config).index(projects)
+    assert result["projects_total"] == result["projects_completed"] == len(projects)
+    assert result["stage_timings_ms"]["total"] >= 0
+    assert {"directory_traversal", "path_check", "stat", "sha256", "sqlite_write", "fts_write"} <= set(result["stage_timings_ms"])
+    for item in result["projects"]:
+        assert item["file_count"] >= 0
+        assert item["scanned_bytes"] >= 0
+        assert item["elapsed_ms"] >= 0
+        assert "path_check" in item["stage_timings_ms"]
+
+
+def test_project_checkpoint_resume_after_interrupt(test_config, monkeypatch):
+    projects = discover_projects(test_config)
+    store = IndexStore(test_config)
+    original = store._index_project
+    interrupt_name = projects[1].name
+
+    def interrupt_once(conn, project, *args, **kwargs):
+        if project.name == interrupt_name:
+            raise KeyboardInterrupt()
+        return original(conn, project, *args, **kwargs)
+
+    monkeypatch.setattr(store, "_index_project", interrupt_once)
+    with pytest.raises(KeyboardInterrupt):
+        store.index(projects, changed_only=True)
+
+    interrupted = IndexStore(test_config).status()
+    assert interrupted["last_index"]["status"] == "interrupted"
+    assert any(item["status"] == "ok" for item in interrupted["project_progress"])
+    assert any(item["status"] == "interrupted" for item in interrupted["project_progress"])
+
+    resumed = IndexStore(test_config).index(projects, changed_only=True, resume=True)
+    assert resumed["status"] == "ok"
+    assert resumed["resume_from_run"] is not None
+    assert any(item["status"] == "resumed" for item in resumed["projects"])
 
 
 def test_manual_verification_expires_when_evidence_changes(test_config, fixture_root):

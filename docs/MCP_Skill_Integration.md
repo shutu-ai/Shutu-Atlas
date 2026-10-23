@@ -80,3 +80,28 @@ after backing it up. The project never overwrites an existing user config.
 OpenCode remains `UNVERIFIED`: the CLI was present, but the environment
 rejected its log-file open with `EPERM`, so no authenticated client session or
 user-level configuration change was attempted.
+
+## Final real Codex CLI evidence
+
+On 2026-10-23 the real `codex exec` CLI was run in the fresh Git target
+`.local/codex-e2e-20261023-retry` with a one-shot MCP configuration override;
+the user's `C:\Users\swx1536744\.codex\config.toml` was not changed. Codex
+loaded `skills/local-project-reuse/SKILL.md` and called `atlas_health`,
+`atlas_find_capability`, `atlas_search_code`, and `atlas_get_source` through
+the Shutu-Atlas stdio server.
+
+The selected evidence was
+`D:\dev-projects\English-Practice\benchmark.go:362-373`,
+project_id `aeac851c36b9a320`, file_id `2329`, Git HEAD
+`f80ceeee2b7932ccaba962f942c00a71ee850078`, branch `main`. The exact code
+search returned no `recover_after_restart` implementation; the bounded source
+range contained only a `PostProbeRecovery` metric field at line 366. Codex
+classified the capability as `inferred/unverified` and did not claim reuse.
+It created only `reused_app.py` and `test_reused_app.py` in the disposable
+target and ran `python -m pytest -q` with 4 passing tests.
+
+The first attempt was intentionally recorded as blocked because it overlapped
+the active SQLite writer and returned `database is locked` during MCP
+initialization. After run 20 completed, direct MCP initialize and the full
+Codex sequence succeeded. This is why the retry evidence is the authoritative
+Agent acceptance record.

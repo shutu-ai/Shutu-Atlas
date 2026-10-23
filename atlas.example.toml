@@ -8,7 +8,7 @@ serena_workspaces = ".local/serena-workspaces"
 roots = ["D:/dev-projects"]
 include_projects = []
 exclude_projects = ["Shutu-Atlas"]
-excluded_dirs = [".git", ".local", "node_modules", ".venv", "dist", "build", "coverage", "__pycache__"]
+excluded_dirs = [".git", ".local", "node_modules", ".venv", "dist", "build", "coverage", "__pycache__", ".codegraph", ".go-cache", ".go-mod-cache", ".deploy-staging", "pytest-cache-files"]
 
 [limits]
 max_file_bytes = 512000
@@ -17,4 +17,5 @@ max_results = 50
 max_snippet_lines = 12
 max_chars = 8000
 command_timeout_seconds = 8.0
+changed_only_hash_mode = "stat"
 

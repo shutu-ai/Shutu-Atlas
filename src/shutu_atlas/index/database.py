@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -13,7 +14,8 @@ import time
 from typing import Any
 
 from ..config import AtlasConfig
-from ..discovery import ProjectRecord, allowed_source_path, iter_project_files
+from ..discovery import ProjectRecord, ProjectScan, allowed_source_path, scan_project_files
+from .metrics import StageMetrics, elapsed_ms, timed
 
 
 SCHEMA = """
@@ -23,6 +25,7 @@ INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '1');
 CREATE TABLE IF NOT EXISTS projects (
   project_id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
   is_git INTEGER NOT NULL, git_head TEXT, branch TEXT, dirty INTEGER,
+  git_status_hash TEXT,
   languages_json TEXT NOT NULL, frameworks_json TEXT NOT NULL, markers_json TEXT NOT NULL,
   discovery_kind TEXT NOT NULL, excluded INTEGER NOT NULL DEFAULT 0,
   exclusion_reason TEXT, indexed_at TEXT, file_count INTEGER NOT NULL DEFAULT 0
@@ -71,15 +74,51 @@ CREATE TABLE IF NOT EXISTS ui_asset_aliases (
 CREATE TABLE IF NOT EXISTS index_runs (
   run_id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, finished_at TEXT,
   mode TEXT NOT NULL, projects_seen INTEGER NOT NULL DEFAULT 0, files_indexed INTEGER NOT NULL DEFAULT 0,
-  errors INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, owner_pid INTEGER
+  errors INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, owner_pid INTEGER,
+  elapsed_ms REAL NOT NULL DEFAULT 0, projects_total INTEGER NOT NULL DEFAULT 0,
+  projects_completed INTEGER NOT NULL DEFAULT 0, files_scanned INTEGER NOT NULL DEFAULT 0,
+  scanned_bytes INTEGER NOT NULL DEFAULT 0, skipped_files INTEGER NOT NULL DEFAULT 0,
+  changed_files INTEGER NOT NULL DEFAULT 0, unchanged_files INTEGER NOT NULL DEFAULT 0,
+  stage_timings_json TEXT NOT NULL DEFAULT '{}', stage_counts_json TEXT NOT NULL DEFAULT '{}',
+  hash_mode TEXT NOT NULL DEFAULT 'always', resume_from_run INTEGER
 );
 CREATE TABLE IF NOT EXISTS index_errors (
   error_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL REFERENCES index_runs(run_id) ON DELETE CASCADE,
   project_id TEXT, relative_path TEXT, error_type TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS index_project_runs (
+  project_run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL REFERENCES index_runs(run_id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  path TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  elapsed_ms REAL NOT NULL DEFAULT 0,
+  file_count INTEGER NOT NULL DEFAULT 0,
+  scanned_bytes INTEGER NOT NULL DEFAULT 0,
+  skipped_count INTEGER NOT NULL DEFAULT 0,
+  changed_count INTEGER NOT NULL DEFAULT 0,
+  unchanged_count INTEGER NOT NULL DEFAULT 0,
+  metadata_updates INTEGER NOT NULL DEFAULT 0,
+  deleted_count INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL,
+  last_relative_path TEXT,
+  stage_timings_json TEXT NOT NULL DEFAULT '{}',
+  stage_counts_json TEXT NOT NULL DEFAULT '{}',
+  error_type TEXT,
+  error_message TEXT,
+  UNIQUE(run_id, project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_index_project_runs_run ON index_project_runs(run_id, ordinal);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_content USING fts5(
   project_id UNINDEXED, file_id UNINDEXED, relative_path, language, content,
   tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TABLE IF NOT EXISTS fts_content_rows (
+  file_id INTEGER PRIMARY KEY,
+  fts_rowid INTEGER NOT NULL UNIQUE
 );
 CREATE INDEX IF NOT EXISTS idx_files_project ON files(project_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
@@ -100,6 +139,48 @@ CAPABILITY_RULES: list[tuple[str, str, tuple[str, ...]]] = [
 
 UI_EXTENSIONS = {".vue": "page_or_component", ".tsx": "page_or_component", ".jsx": "page_or_component", ".html": "page", ".css": "style", ".scss": "style"}
 SCREENSHOT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+@dataclass(slots=True)
+class ProjectIndexResult:
+    project_id: str
+    name: str
+    path: str
+    status: str = "ok"
+    file_count: int = 0
+    scanned_bytes: int = 0
+    skipped_count: int = 0
+    changed_count: int = 0
+    unchanged_count: int = 0
+    metadata_updates: int = 0
+    deleted_count: int = 0
+    last_relative_path: str | None = None
+    elapsed_ms: float = 0.0
+    stage_timings: dict[str, float] | None = None
+    stage_counts: dict[str, int] | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "project_id": self.project_id,
+            "name": self.name,
+            "path": self.path,
+            "status": self.status,
+            "file_count": self.file_count,
+            "scanned_bytes": self.scanned_bytes,
+            "skipped_count": self.skipped_count,
+            "changed_count": self.changed_count,
+            "unchanged_count": self.unchanged_count,
+            "metadata_updates": self.metadata_updates,
+            "deleted_count": self.deleted_count,
+            "last_relative_path": self.last_relative_path,
+            "elapsed_ms": self.elapsed_ms,
+            "stage_timings_ms": self.stage_timings or {},
+            "stage_counts": self.stage_counts or {},
+            "error_type": self.error_type,
+            "error_message": self.error_message,
+        }
 
 
 def utc_now() -> str:
@@ -141,6 +222,10 @@ def connect(db_path: Path, readonly: bool = False) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=10000")
     conn.execute("PRAGMA foreign_keys=ON")
+    if not readonly:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
     return conn
 
 
@@ -154,8 +239,26 @@ def init_db(cfg: AtlasConfig) -> None:
         except (TypeError, ValueError):
             schema_version = 1
         run_columns = {row[1] for row in conn.execute("PRAGMA table_info(index_runs)")}
-        if "owner_pid" not in run_columns:
-            conn.execute("ALTER TABLE index_runs ADD COLUMN owner_pid INTEGER")
+        for column, definition in (
+            ("owner_pid", "INTEGER"),
+            ("elapsed_ms", "REAL NOT NULL DEFAULT 0"),
+            ("projects_total", "INTEGER NOT NULL DEFAULT 0"),
+            ("projects_completed", "INTEGER NOT NULL DEFAULT 0"),
+            ("files_scanned", "INTEGER NOT NULL DEFAULT 0"),
+            ("scanned_bytes", "INTEGER NOT NULL DEFAULT 0"),
+            ("skipped_files", "INTEGER NOT NULL DEFAULT 0"),
+            ("changed_files", "INTEGER NOT NULL DEFAULT 0"),
+            ("unchanged_files", "INTEGER NOT NULL DEFAULT 0"),
+            ("stage_timings_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("stage_counts_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("hash_mode", "TEXT NOT NULL DEFAULT 'always'"),
+            ("resume_from_run", "INTEGER"),
+        ):
+            if column not in run_columns:
+                conn.execute(f"ALTER TABLE index_runs ADD COLUMN {column} {definition}")
+        project_columns = {row[1] for row in conn.execute("PRAGMA table_info(projects)")}
+        if "git_status_hash" not in project_columns:
+            conn.execute("ALTER TABLE projects ADD COLUMN git_status_hash TEXT")
         capability_columns = {row[1] for row in conn.execute("PRAGMA table_info(capabilities)")}
         for column, definition in (
             ("manual_status", "TEXT"),
@@ -169,7 +272,9 @@ def init_db(cfg: AtlasConfig) -> None:
                 conn.execute(f"ALTER TABLE capabilities ADD COLUMN {column} {definition}")
         if schema_version < 4:
             _migrate_ui_asset_ids(conn)
-        conn.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '4')")
+        if schema_version < 6:
+            _migrate_fts_rows(conn)
+        conn.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '6')")
         conn.commit()
 
 
@@ -230,12 +335,32 @@ def _migrate_ui_asset_ids(conn: sqlite3.Connection) -> None:
         )
 
 
-def _sha256(path: Path) -> str:
+def _migrate_fts_rows(conn: sqlite3.Connection) -> None:
+    """Record FTS rowids so incremental replacement never scans the FTS body."""
+
+    if conn.execute("SELECT 1 FROM fts_content_rows LIMIT 1").fetchone():
+        return
+    rows = conn.execute("SELECT rowid,file_id FROM fts_content ORDER BY rowid").fetchall()
+    for row in rows:
+        conn.execute(
+            "INSERT OR IGNORE INTO fts_content_rows(file_id,fts_rowid) VALUES(?,?)",
+            (row["file_id"], row["rowid"]),
+        )
+
+
+def _sha256(path: Path, metrics: StageMetrics | None = None) -> str:
+    started = time.perf_counter_ns()
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    try:
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        if metrics:
+            metrics.add_count("hashes")
+        return digest.hexdigest()
+    finally:
+        if metrics:
+            metrics.add_elapsed("sha256", time.perf_counter_ns() - started)
 
 
 def _language(path: str) -> str:
@@ -323,77 +448,344 @@ class IndexStore:
                         "UPDATE index_runs SET finished_at=?,status='interrupted' WHERE run_id=?",
                         (utc_now(), row["run_id"]),
                     )
+                    conn.execute(
+                        "UPDATE index_project_runs SET finished_at=?,status='interrupted',error_type='OwnerProcessEnded',error_message='index owner process ended' WHERE run_id=? AND status='running'",
+                        (utc_now(), row["run_id"]),
+                    )
                     changed = True
             if changed:
                 conn.commit()
 
     def _upsert_project(self, conn: sqlite3.Connection, project: ProjectRecord) -> None:
         conn.execute(
-            """INSERT INTO projects(project_id,name,path,is_git,git_head,branch,dirty,languages_json,frameworks_json,markers_json,discovery_kind,excluded,exclusion_reason,indexed_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(project_id) DO UPDATE SET name=excluded.name,path=excluded.path,is_git=excluded.is_git,git_head=excluded.git_head,branch=excluded.branch,dirty=excluded.dirty,languages_json=excluded.languages_json,frameworks_json=excluded.frameworks_json,markers_json=excluded.markers_json,discovery_kind=excluded.discovery_kind,excluded=excluded.excluded,exclusion_reason=excluded.exclusion_reason,indexed_at=excluded.indexed_at""",
-            (project.project_id, project.name, project.path, int(project.is_git), project.git_head, project.branch, None if project.dirty is None else int(project.dirty), json.dumps(project.languages), json.dumps(project.frameworks), json.dumps(project.markers), project.discovery_kind, int(project.excluded), project.exclusion_reason, utc_now()),
+            """INSERT INTO projects(project_id,name,path,is_git,git_head,branch,dirty,git_status_hash,languages_json,frameworks_json,markers_json,discovery_kind,excluded,exclusion_reason,indexed_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(project_id) DO UPDATE SET name=excluded.name,path=excluded.path,is_git=excluded.is_git,git_head=excluded.git_head,branch=excluded.branch,dirty=excluded.dirty,git_status_hash=excluded.git_status_hash,languages_json=excluded.languages_json,frameworks_json=excluded.frameworks_json,markers_json=excluded.markers_json,discovery_kind=excluded.discovery_kind,excluded=excluded.excluded,exclusion_reason=excluded.exclusion_reason,indexed_at=excluded.indexed_at""",
+            (project.project_id, project.name, project.path, int(project.is_git), project.git_head, project.branch, None if project.dirty is None else int(project.dirty), project.git_status_hash, json.dumps(project.languages), json.dumps(project.frameworks), json.dumps(project.markers), project.discovery_kind, int(project.excluded), project.exclusion_reason, utc_now()),
         )
 
-    def index(self, projects: Iterable[ProjectRecord], changed_only: bool = False) -> dict[str, Any]:
+    def index(
+        self,
+        projects: Iterable[ProjectRecord],
+        changed_only: bool = False,
+        force_hash: bool = False,
+        resume: bool = False,
+        retry_projects: Iterable[str] | None = None,
+        discovery_report: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         self.cfg.ensure_local_dirs()
+        started = time.perf_counter_ns()
         project_list = list(projects)
-        with connect(self.cfg.db_path) as conn:
-            cur = conn.execute("INSERT INTO index_runs(started_at,mode,status,owner_pid) VALUES(?,?,?,?)", (utc_now(), "changed-only" if changed_only else "full", "running", os.getpid()))
-            run_id = cur.lastrowid
-            conn.commit()
-            counts = {"projects_seen": 0, "files_indexed": 0, "errors": 0}
-            try:
-                for project in project_list:
-                    if project.excluded:
-                        continue
-                    counts["projects_seen"] += 1
-                    try:
-                        counts["files_indexed"] += self._index_project(conn, project, changed_only)
-                        conn.commit()
-                    except Exception as exc:  # keep other projects independently indexable
-                        conn.rollback()
-                        counts["errors"] += 1
-                        conn.execute("INSERT INTO index_errors(run_id,project_id,relative_path,error_type,message,created_at) VALUES(?,?,?,?,?,?)", (run_id, project.project_id, None, type(exc).__name__, str(exc)[:1000], utc_now()))
-                        conn.commit()
-                    conn.execute(
-                        "UPDATE index_runs SET projects_seen=?,files_indexed=?,errors=? WHERE run_id=?",
-                        (counts["projects_seen"], counts["files_indexed"], counts["errors"], run_id),
-                    )
-                    conn.commit()
-                # A root-wide refresh is authoritative.  A targeted include
-                # refresh must preserve projects outside the requested set.
-                if not self.cfg.include_projects:
-                    ids = [project.project_id for project in project_list if not project.excluded]
-                    if ids:
-                        placeholders = ",".join("?" for _ in ids)
-                        orphan_rows = conn.execute(
-                            f"SELECT project_id FROM projects WHERE project_id NOT IN ({placeholders})",
-                            ids,
-                        ).fetchall()
-                        for orphan in orphan_rows:
-                            conn.execute("DELETE FROM fts_content WHERE project_id=?", (orphan["project_id"],))
-                        conn.execute(f"DELETE FROM projects WHERE project_id NOT IN ({placeholders})", ids)
-                    else:
-                        conn.execute("DELETE FROM fts_content")
-                        conn.execute("DELETE FROM projects")
-                    # FTS5 has no foreign-key cascade; remove rows left by
-                    # older databases and by projects deleted before this
-                    # reconciliation step existed.
-                    conn.execute("DELETE FROM fts_content WHERE project_id NOT IN (SELECT project_id FROM projects)")
-                    conn.commit()
-            except KeyboardInterrupt:
-                conn.rollback()
-                conn.execute("UPDATE index_runs SET finished_at=?,projects_seen=?,files_indexed=?,errors=?,status=? WHERE run_id=?", (utc_now(), counts["projects_seen"], counts["files_indexed"], counts["errors"], "interrupted", run_id))
-                conn.commit()
-                raise
-            conn.execute("UPDATE index_runs SET finished_at=?,projects_seen=?,files_indexed=?,errors=?,status=? WHERE run_id=?", (utc_now(), counts["projects_seen"], counts["files_indexed"], counts["errors"], "ok" if not counts["errors"] else "partial", run_id))
-            conn.commit()
-            return {"run_id": run_id, **counts, "status": "ok" if not counts["errors"] else "partial"}
+        eligible = [project for project in project_list if not project.excluded]
+        retry_set = {str(value) for value in (retry_projects or []) if str(value)}
+        retry_only = bool(retry_set)
+        target_projects = [
+            project for project in eligible
+            if not retry_set or project.name in retry_set or project.project_id in retry_set
+        ]
+        force_hash = bool(force_hash and changed_only)
+        hash_mode = "force-hash" if force_hash else ("stat" if changed_only else "always")
+        mode = "changed-only" if changed_only else "full"
+        run_metrics = StageMetrics()
+        project_results: list[ProjectIndexResult] = []
 
-    def _index_project(self, conn: sqlite3.Connection, project: ProjectRecord, changed_only: bool) -> int:
+        with connect(self.cfg.db_path) as conn:
+            resume_from_run: int | None = None
+            resume_checkpoints: dict[str, sqlite3.Row] = {}
+            if resume:
+                previous_run = conn.execute(
+                    "SELECT * FROM index_runs WHERE status='interrupted' AND mode=? ORDER BY run_id DESC LIMIT 1",
+                    (mode,),
+                ).fetchone()
+                if previous_run:
+                    previous_hash_mode = previous_run["hash_mode"] if "hash_mode" in previous_run.keys() else None
+                    if previous_hash_mode in {None, hash_mode, "always"}:
+                        resume_from_run = int(previous_run["run_id"])
+                        resume_checkpoints = {
+                            row["project_id"]: row
+                            for row in conn.execute(
+                                "SELECT * FROM index_project_runs WHERE run_id=? AND status IN ('ok','unchanged','resumed')",
+                                (resume_from_run,),
+                            ).fetchall()
+                        }
+            cur = conn.execute(
+                """INSERT INTO index_runs(
+                    started_at,mode,status,owner_pid,projects_total,hash_mode,resume_from_run,
+                    stage_timings_json,stage_counts_json
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    utc_now(), mode, "running", os.getpid(), len(target_projects), hash_mode,
+                    resume_from_run, "{}", "{}",
+                ),
+            )
+            run_id = int(cur.lastrowid)
+            conn.commit()
+            counts: dict[str, int] = {
+                "projects_seen": 0,
+                "projects_completed": 0,
+                "files_indexed": 0,
+                "files_scanned": 0,
+                "scanned_bytes": 0,
+                "skipped_files": 0,
+                "changed_files": 0,
+                "unchanged_files": 0,
+                "errors": 0,
+            }
+            if discovery_report:
+                for name, value in discovery_report.get("operation_counts", {}).items():
+                    run_metrics.add_count(f"discovery.{name}", int(value))
+
+            def update_run(status: str = "running") -> None:
+                stage_timings = dict(run_metrics.timings_ms())
+                if discovery_report:
+                    discovery_timings = discovery_report.get("timings_ms", {})
+                    for name, value in discovery_timings.items():
+                        stage_timings[f"discovery.{name}"] = value
+                stage_timings["total"] = elapsed_ms(started)
+                conn.execute(
+                    """UPDATE index_runs SET finished_at=?,elapsed_ms=?,projects_seen=?,projects_completed=?,
+                        files_indexed=?,files_scanned=?,scanned_bytes=?,skipped_files=?,changed_files=?,
+                        unchanged_files=?,errors=?,status=?,stage_timings_json=?,stage_counts_json=?
+                        WHERE run_id=?""",
+                    (
+                        utc_now() if status != "running" else None, stage_timings["total"],
+                        counts["projects_seen"], counts["projects_completed"], counts["files_indexed"],
+                        counts["files_scanned"], counts["scanned_bytes"], counts["skipped_files"],
+                        counts["changed_files"], counts["unchanged_files"], counts["errors"], status,
+                        json.dumps(stage_timings, ensure_ascii=False),
+                        json.dumps(run_metrics.counts, ensure_ascii=False), run_id,
+                    ),
+                )
+
+            for ordinal, project in enumerate(target_projects, 1):
+                counts["projects_seen"] += 1
+                project_started = time.perf_counter_ns()
+                checkpoint = resume_checkpoints.get(project.project_id)
+                result = ProjectIndexResult(project.project_id, project.name, project.path)
+                conn.execute(
+                    """INSERT INTO index_project_runs(
+                        run_id,project_id,ordinal,name,path,started_at,status
+                    ) VALUES(?,?,?,?,?,?,?)""",
+                    (run_id, project.project_id, ordinal, project.name, project.path, utc_now(), "running"),
+                )
+                conn.commit()
+                try:
+                    scan: ProjectScan | None = None
+                    if checkpoint and not force_hash:
+                        scan = scan_project_files(project, self.cfg)
+                        if self._scan_matches_existing(conn, project.project_id, scan):
+                            with timed(run_metrics, "sqlite_write"):
+                                self._upsert_project(conn, project)
+                                conn.execute(
+                                    "UPDATE projects SET file_count=(SELECT count(*) FROM files WHERE project_id=?) WHERE project_id=?",
+                                    (project.project_id, project.project_id),
+                                )
+                            result = self._resumed_result(project, scan, project_started)
+                        else:
+                            result = self._index_project(
+                                conn, project, changed_only=True, force_hash=False, scan=scan,
+                            )
+                    else:
+                        result = self._index_project(
+                            conn, project, changed_only=changed_only, force_hash=force_hash, scan=None,
+                        )
+                    conn.commit()
+                    for name, value in (result.stage_timings or {}).items():
+                        run_metrics.add_elapsed(name, int(float(value) * 1_000_000))
+                    for name, value in (result.stage_counts or {}).items():
+                        run_metrics.add_count(name, int(value))
+                    if result.status == "partial":
+                        counts["errors"] += 1
+                        conn.execute(
+                            "INSERT INTO index_errors(run_id,project_id,relative_path,error_type,message,created_at) VALUES(?,?,?,?,?,?)",
+                            (run_id, project.project_id, result.last_relative_path, result.error_type or "PartialProject", result.error_message or "project scan was truncated", utc_now()),
+                        )
+                    counts["files_indexed"] += result.changed_count
+                    counts["files_scanned"] += result.file_count
+                    counts["scanned_bytes"] += result.scanned_bytes
+                    counts["skipped_files"] += result.skipped_count
+                    counts["changed_files"] += result.changed_count
+                    counts["unchanged_files"] += result.unchanged_count
+                    counts["projects_completed"] += 1
+                except KeyboardInterrupt:
+                    conn.rollback()
+                    result.status = "interrupted"
+                    result.elapsed_ms = elapsed_ms(project_started)
+                    self._finish_project_run(conn, run_id, result)
+                    update_run("interrupted")
+                    conn.commit()
+                    raise
+                except Exception as exc:  # keep other projects independently indexable
+                    conn.rollback()
+                    counts["errors"] += 1
+                    result.status = "error"
+                    result.error_type = type(exc).__name__
+                    result.error_message = str(exc)[:1000]
+                    result.elapsed_ms = elapsed_ms(project_started)
+                    conn.execute(
+                        "INSERT INTO index_errors(run_id,project_id,relative_path,error_type,message,created_at) VALUES(?,?,?,?,?,?)",
+                        (run_id, project.project_id, None, type(exc).__name__, str(exc)[:1000], utc_now()),
+                    )
+                self._finish_project_run(conn, run_id, result)
+                project_results.append(result)
+                update_run("running")
+                conn.commit()
+
+            # A root-wide reconciliation is only safe after every target was
+            # visited successfully.  Targeted retries never prune other data.
+            if not self.cfg.include_projects and not retry_only and counts["errors"] == 0:
+                ids = [project.project_id for project in eligible]
+                if ids:
+                    placeholders = ",".join("?" for _ in ids)
+                    orphan_rows = conn.execute(
+                        f"SELECT project_id FROM projects WHERE project_id NOT IN ({placeholders})", ids,
+                    ).fetchall()
+                    for orphan in orphan_rows:
+                        conn.execute("DELETE FROM fts_content WHERE project_id=?", (orphan["project_id"],))
+                    conn.execute(f"DELETE FROM projects WHERE project_id NOT IN ({placeholders})", ids)
+                else:
+                    conn.execute("DELETE FROM fts_content")
+                    conn.execute("DELETE FROM projects")
+                conn.execute("DELETE FROM fts_content WHERE project_id NOT IN (SELECT project_id FROM projects)")
+                conn.execute("DELETE FROM fts_content_rows WHERE file_id NOT IN (SELECT file_id FROM files)")
+                conn.commit()
+            final_status = "ok" if counts["errors"] == 0 and counts["projects_completed"] == len(target_projects) else "partial"
+            update_run(final_status)
+            conn.commit()
+            result = {
+                "run_id": run_id,
+                "mode": mode,
+                "hash_mode": hash_mode,
+                "resume_from_run": resume_from_run,
+                "projects_total": len(target_projects),
+                **counts,
+                "status": final_status,
+                "elapsed_ms": elapsed_ms(started),
+                "stage_timings_ms": json.loads(conn.execute("SELECT stage_timings_json FROM index_runs WHERE run_id=?", (run_id,)).fetchone()[0]),
+                "stage_counts": run_metrics.counts,
+                "projects": [item.to_dict() for item in project_results],
+            }
+            return result
+
+    def _scan_matches_existing(self, conn: sqlite3.Connection, project_id: str, scan: ProjectScan) -> bool:
+        if scan.truncated:
+            return False
+        rows = conn.execute(
+            "SELECT relative_path,size_bytes,modified_ns FROM files WHERE project_id=?",
+            (project_id,),
+        ).fetchall()
+        if len(rows) != len(scan.files):
+            return False
+        old = {row["relative_path"]: row for row in rows}
+        for item in scan.files:
+            previous = old.get(item.relative)
+            if not previous or previous["size_bytes"] != item.stat_result.st_size or previous["modified_ns"] != item.stat_result.st_mtime_ns:
+                return False
+        return True
+
+    def _resumed_result(self, project: ProjectRecord, scan: ProjectScan, started_ns: int) -> ProjectIndexResult:
+        result = ProjectIndexResult(
+            project_id=project.project_id,
+            name=project.name,
+            path=project.path,
+            status="resumed",
+            file_count=scan.eligible_total or len(scan.files),
+            scanned_bytes=scan.scanned_bytes,
+            skipped_count=scan.skipped_count,
+            unchanged_count=len(scan.files),
+            elapsed_ms=elapsed_ms(started_ns),
+            stage_timings=scan.metrics.timings_ms(),
+            stage_counts=dict(scan.metrics.counts),
+        )
+        return result
+
+    def _finish_project_run(self, conn: sqlite3.Connection, run_id: int, result: ProjectIndexResult) -> None:
+        conn.execute(
+            """UPDATE index_project_runs SET finished_at=?,elapsed_ms=?,file_count=?,scanned_bytes=?,
+                skipped_count=?,changed_count=?,unchanged_count=?,metadata_updates=?,deleted_count=?,
+                status=?,last_relative_path=?,stage_timings_json=?,stage_counts_json=?,error_type=?,error_message=?
+                WHERE run_id=? AND project_id=?""",
+            (
+                utc_now(), result.elapsed_ms, result.file_count, result.scanned_bytes, result.skipped_count,
+                result.changed_count, result.unchanged_count, result.metadata_updates, result.deleted_count,
+                result.status, result.last_relative_path,
+                json.dumps(result.stage_timings or {}, ensure_ascii=False),
+                json.dumps(result.stage_counts or {}, ensure_ascii=False),
+                result.error_type, result.error_message, run_id, result.project_id,
+            ),
+        )
+
+    def _fts_rowid(self, conn: sqlite3.Connection, file_id: int) -> int:
+        row = conn.execute("SELECT fts_rowid FROM fts_content_rows WHERE file_id=?", (file_id,)).fetchone()
+        if row:
+            return int(row[0])
+        candidate = int(file_id)
+        if conn.execute("SELECT 1 FROM fts_content WHERE rowid=?", (candidate,)).fetchone():
+            candidate = int(conn.execute("SELECT COALESCE(MAX(rowid),0)+1 FROM fts_content").fetchone()[0])
+        conn.execute("INSERT INTO fts_content_rows(file_id,fts_rowid) VALUES(?,?)", (file_id, candidate))
+        return candidate
+
+    def _replace_fts_row(
+        self,
+        conn: sqlite3.Connection,
+        project_id: str,
+        file_id: int,
+        relative: str,
+        language: str,
+        text: str,
+    ) -> None:
+        rowid = self._fts_rowid(conn, file_id)
+        conn.execute("DELETE FROM fts_content WHERE rowid=?", (rowid,))
+        conn.execute(
+            "INSERT INTO fts_content(rowid,project_id,file_id,relative_path,language,content) VALUES(?,?,?,?,?,?)",
+            (rowid, project_id, file_id, relative, language, text),
+        )
+
+    def _delete_fts_row(self, conn: sqlite3.Connection, file_id: int) -> None:
+        row = conn.execute("SELECT fts_rowid FROM fts_content_rows WHERE file_id=?", (file_id,)).fetchone()
+        if row:
+            conn.execute("DELETE FROM fts_content WHERE rowid=?", (int(row[0]),))
+            conn.execute("DELETE FROM fts_content_rows WHERE file_id=?", (file_id,))
+        else:
+            # Compatibility with a hand-created/older database that has no
+            # migration row yet.  This path is only used once per such file.
+            conn.execute("DELETE FROM fts_content WHERE file_id=?", (file_id,))
+
+    def _index_project(
+        self,
+        conn: sqlite3.Connection,
+        project: ProjectRecord,
+        changed_only: bool,
+        force_hash: bool = False,
+        scan: ProjectScan | None = None,
+    ) -> ProjectIndexResult:
+        started = time.perf_counter_ns()
+        metrics = StageMetrics()
         now = utc_now()
-        self._upsert_project(conn, project)
+        scan = scan or scan_project_files(project, self.cfg)
+        metrics.merge(scan.metrics)
+        if scan.truncated:
+            with timed(metrics, "sqlite_write"):
+                self._upsert_project(conn, project)
+            return ProjectIndexResult(
+                project_id=project.project_id,
+                name=project.name,
+                path=project.path,
+                status="partial",
+                file_count=scan.eligible_total,
+                scanned_bytes=scan.scanned_bytes,
+                skipped_count=scan.skipped_count,
+                elapsed_ms=elapsed_ms(started),
+                stage_timings=metrics.timings_ms(),
+                stage_counts=dict(metrics.counts),
+                error_type="FileLimitReached",
+                error_message=(
+                    f"{scan.eligible_total} eligible files exceed max_files_per_project="
+                    f"{self.cfg.limits.max_files_per_project}"
+                ),
+            )
+        with timed(metrics, "sqlite_write"):
+            self._upsert_project(conn, project)
         old = {row["relative_path"]: dict(row) for row in conn.execute("SELECT * FROM files WHERE project_id=?", (project.project_id,))}
         old_assets = {
             row["file_id"]: dict(row)
@@ -401,66 +793,158 @@ class IndexStore:
         }
         seen: set[str] = set()
         changed = 0
-        for path, relative in iter_project_files(project, self.cfg):
+        unchanged = 0
+        metadata_updates = 0
+        last_relative: str | None = None
+
+        for item in scan.files:
+            path = item.path
+            relative = item.relative
+            stat_result = item.stat_result
             seen.add(relative)
-            stat = path.stat()
-            digest = _sha256(path)
+            last_relative = relative
             previous = old.get(relative)
-            if changed_only and previous and previous["sha256"] == digest and previous["size_bytes"] == stat.st_size and previous["modified_ns"] == stat.st_mtime_ns:
+            stat_same = bool(
+                previous
+                and previous["size_bytes"] == stat_result.st_size
+                and previous["modified_ns"] == stat_result.st_mtime_ns
+            )
+            if changed_only and stat_same and not force_hash:
+                unchanged += 1
                 continue
-            text = path.read_text(encoding="utf-8", errors="replace")[: self.cfg.limits.max_chars * 64]
+
+            digest = _sha256(path, metrics)
+            if changed_only and previous and digest == previous["sha256"]:
+                if not stat_same:
+                    with timed(metrics, "sqlite_write"):
+                        conn.execute(
+                            "UPDATE files SET size_bytes=?,modified_ns=?,sha256=?,indexed_at=? WHERE file_id=?",
+                            (stat_result.st_size, stat_result.st_mtime_ns, digest, now, previous["file_id"]),
+                        )
+                    metadata_updates += 1
+                unchanged += 1
+                continue
+
+            with timed(metrics, "read_source"):
+                text = path.read_text(encoding="utf-8", errors="replace")[: self.cfg.limits.max_chars * 64]
             language = _language(relative)
-            conn.execute("INSERT INTO files(project_id,relative_path,language,size_bytes,modified_ns,sha256,is_working_tree,indexed_at) VALUES(?,?,?,?,?,?,1,?) ON CONFLICT(project_id,relative_path) DO UPDATE SET language=excluded.language,size_bytes=excluded.size_bytes,modified_ns=excluded.modified_ns,sha256=excluded.sha256,is_working_tree=1,indexed_at=excluded.indexed_at", (project.project_id, relative, language, stat.st_size, stat.st_mtime_ns, digest, now))
-            file_id = conn.execute("SELECT file_id FROM files WHERE project_id=? AND relative_path=?", (project.project_id, relative)).fetchone()[0]
-            conn.execute("DELETE FROM fts_content WHERE file_id=?", (file_id,))
-            conn.execute("INSERT INTO fts_content(project_id,file_id,relative_path,language,content) VALUES(?,?,?,?,?)", (project.project_id, file_id, relative, language, text))
-            conn.execute("DELETE FROM symbols WHERE file_id=?", (file_id,))
-            conn.executemany("INSERT INTO symbols(file_id,name,kind,start_line,end_line,signature,source) VALUES(?,?,?,?,?,?,?)", [(file_id, s["name"], s["kind"], s["start_line"], s["end_line"], s["signature"], s["source"]) for s in extract_symbols(text, language)])
-            conn.execute("DELETE FROM capability_evidence WHERE file_id=?", (file_id,))
-            for cap in detect_capabilities(text, language):
-                conn.execute(
-                    "INSERT INTO capabilities(project_id,name,label,status,updated_at) VALUES(?,?,?,?,?) "
-                    "ON CONFLICT(project_id,name) DO UPDATE SET "
-                    "label=CASE WHEN capabilities.manual_label IS NULL THEN excluded.label ELSE capabilities.manual_label END, "
-                    "status=CASE WHEN capabilities.manual_status IS NULL THEN excluded.status ELSE capabilities.manual_status END, "
-                    "updated_at=excluded.updated_at",
-                    (project.project_id, cap["name"], cap["label"], cap["status"], now),
+            with timed(metrics, "symbol_detection"):
+                symbols = extract_symbols(text, language)
+            with timed(metrics, "capability_detection"):
+                capabilities = detect_capabilities(text, language)
+
+            with timed(metrics, "sqlite_write"):
+                if previous:
+                    conn.execute(
+                        "UPDATE files SET language=?,size_bytes=?,modified_ns=?,sha256=?,is_working_tree=1,indexed_at=? WHERE file_id=?",
+                        (language, stat_result.st_size, stat_result.st_mtime_ns, digest, now, previous["file_id"]),
+                    )
+                    file_id = int(previous["file_id"])
+                else:
+                    cursor = conn.execute(
+                        "INSERT INTO files(project_id,relative_path,language,size_bytes,modified_ns,sha256,is_working_tree,indexed_at) VALUES(?,?,?,?,?,?,1,?)",
+                        (project.project_id, relative, language, stat_result.st_size, stat_result.st_mtime_ns, digest, now),
+                    )
+                    file_id = int(cursor.lastrowid)
+                conn.execute("DELETE FROM symbols WHERE file_id=?", (file_id,))
+                conn.executemany(
+                    "INSERT INTO symbols(file_id,name,kind,start_line,end_line,signature,source) VALUES(?,?,?,?,?,?,?)",
+                    [(file_id, s["name"], s["kind"], s["start_line"], s["end_line"], s["signature"], s["source"]) for s in symbols],
                 )
-                cap_id = conn.execute("SELECT capability_id FROM capabilities WHERE project_id=? AND name=?", (project.project_id, cap["name"])).fetchone()[0]
-                conn.execute("INSERT INTO capability_evidence(capability_id,file_id,start_line,end_line,snippet,reason) VALUES(?,?,?,?,?,?)", (cap_id, file_id, cap["line"], cap["line"], cap["snippet"], cap["reason"]))
+                conn.execute("DELETE FROM capability_evidence WHERE file_id=?", (file_id,))
+                for capability in capabilities:
+                    conn.execute(
+                        "INSERT INTO capabilities(project_id,name,label,status,updated_at) VALUES(?,?,?,?,?) "
+                        "ON CONFLICT(project_id,name) DO UPDATE SET "
+                        "label=CASE WHEN capabilities.manual_label IS NULL THEN excluded.label ELSE capabilities.manual_label END, "
+                        "status=CASE WHEN capabilities.manual_status IS NULL THEN excluded.status ELSE capabilities.manual_status END, "
+                        "updated_at=excluded.updated_at",
+                        (project.project_id, capability["name"], capability["label"], capability["status"], now),
+                    )
+                    cap_id = conn.execute(
+                        "SELECT capability_id FROM capabilities WHERE project_id=? AND name=?",
+                        (project.project_id, capability["name"]),
+                    ).fetchone()[0]
+                    conn.execute(
+                        "INSERT INTO capability_evidence(capability_id,file_id,start_line,end_line,snippet,reason) VALUES(?,?,?,?,?,?)",
+                        (cap_id, file_id, capability["line"], capability["line"], capability["snippet"], capability["reason"]),
+                    )
+
+            with timed(metrics, "fts_write"):
+                self._replace_fts_row(conn, project.project_id, file_id, relative, language, text)
+
             previous_asset = old_assets.get(file_id)
-            conn.execute("DELETE FROM ui_source_links WHERE file_id=?", (file_id,))
-            conn.execute("DELETE FROM ui_assets WHERE file_id=?", (file_id,))
-            asset = detect_ui_asset(relative, text, project.project_id)
-            if asset:
-                screenshot_status, screenshot_path = self._preserved_screenshot(previous_asset)
-                conn.execute(
-                    """INSERT INTO ui_assets(
-                        asset_id,project_id,file_id,asset_type,name,search_text,features_json,
-                        screenshot_status,screenshot_path,confidence,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(asset_id) DO UPDATE SET
-                        project_id=excluded.project_id,file_id=excluded.file_id,
-                        asset_type=excluded.asset_type,name=excluded.name,
-                        search_text=excluded.search_text,features_json=excluded.features_json,
-                        screenshot_status=excluded.screenshot_status,
-                        screenshot_path=excluded.screenshot_path,
-                        confidence=excluded.confidence,updated_at=excluded.updated_at""",
-                    (
-                        asset["asset_id"], project.project_id, file_id, asset["asset_type"], asset["name"],
-                        asset["search_text"], json.dumps(asset["features"], ensure_ascii=False),
-                        screenshot_status, screenshot_path, "inferred", now,
-                    ),
-                )
-                conn.execute("INSERT OR REPLACE INTO ui_source_links(asset_id,file_id,start_line,end_line) VALUES(?,?,?,?)", (asset["asset_id"], file_id, asset["start_line"], asset["end_line"]))
+            if previous_asset or Path(relative).suffix.lower() in UI_EXTENSIONS:
+                with timed(metrics, "sqlite_write"):
+                    conn.execute("DELETE FROM ui_source_links WHERE file_id=?", (file_id,))
+                    conn.execute("DELETE FROM ui_assets WHERE file_id=?", (file_id,))
+                    asset = detect_ui_asset(relative, text, project.project_id)
+                    if asset:
+                        screenshot_status, screenshot_path = self._preserved_screenshot(previous_asset)
+                        conn.execute(
+                            """INSERT INTO ui_assets(
+                                asset_id,project_id,file_id,asset_type,name,search_text,features_json,
+                                screenshot_status,screenshot_path,confidence,updated_at
+                            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                            ON CONFLICT(asset_id) DO UPDATE SET
+                                project_id=excluded.project_id,file_id=excluded.file_id,
+                                asset_type=excluded.asset_type,name=excluded.name,
+                                search_text=excluded.search_text,features_json=excluded.features_json,
+                                screenshot_status=excluded.screenshot_status,
+                                screenshot_path=excluded.screenshot_path,
+                                confidence=excluded.confidence,updated_at=excluded.updated_at""",
+                            (
+                                asset["asset_id"], project.project_id, file_id, asset["asset_type"], asset["name"],
+                                asset["search_text"], json.dumps(asset["features"], ensure_ascii=False),
+                                screenshot_status, screenshot_path, "inferred", now,
+                            ),
+                        )
+                        conn.execute(
+                            "INSERT OR REPLACE INTO ui_source_links(asset_id,file_id,start_line,end_line) VALUES(?,?,?,?)",
+                            (asset["asset_id"], file_id, asset["start_line"], asset["end_line"]),
+                        )
             changed += 1
-        for relative, row in old.items():
-            if relative not in seen:
-                conn.execute("DELETE FROM files WHERE file_id=?", (row["file_id"],))
-                conn.execute("DELETE FROM fts_content WHERE file_id=?", (row["file_id"],))
-                conn.execute("DELETE FROM capabilities WHERE project_id=? AND capability_id NOT IN (SELECT DISTINCT c.capability_id FROM capabilities c JOIN capability_evidence e ON e.capability_id=c.capability_id WHERE c.project_id=?)", (project.project_id, project.project_id))
-        conn.execute("UPDATE projects SET file_count=(SELECT count(*) FROM files WHERE project_id=?) WHERE project_id=?", (project.project_id, project.project_id))
-        return changed
+
+        deleted = 0
+        with timed(metrics, "sqlite_write"):
+            for relative, row in old.items():
+                if relative in seen:
+                    continue
+                file_id = row["file_id"]
+                conn.execute("DELETE FROM ui_source_links WHERE file_id=?", (file_id,))
+                conn.execute("DELETE FROM ui_assets WHERE file_id=?", (file_id,))
+                conn.execute("DELETE FROM files WHERE file_id=?", (file_id,))
+                self._delete_fts_row(conn, file_id)
+                deleted += 1
+            conn.execute(
+                "DELETE FROM capabilities WHERE project_id=? AND capability_id NOT IN "
+                "(SELECT DISTINCT c.capability_id FROM capabilities c JOIN capability_evidence e ON e.capability_id=c.capability_id WHERE c.project_id=?)",
+                (project.project_id, project.project_id),
+            )
+            conn.execute(
+                "UPDATE projects SET file_count=(SELECT count(*) FROM files WHERE project_id=?) WHERE project_id=?",
+                (project.project_id, project.project_id),
+            )
+        status = "partial" if scan.truncated else ("unchanged" if changed == 0 and metadata_updates == 0 and deleted == 0 else "ok")
+        return ProjectIndexResult(
+            project_id=project.project_id,
+            name=project.name,
+            path=project.path,
+            status=status,
+            file_count=scan.eligible_total or len(scan.files),
+            scanned_bytes=scan.scanned_bytes,
+            skipped_count=scan.skipped_count,
+            changed_count=changed,
+            unchanged_count=unchanged,
+            metadata_updates=metadata_updates,
+            deleted_count=deleted,
+            last_relative_path=last_relative,
+            elapsed_ms=elapsed_ms(started),
+            stage_timings=metrics.timings_ms(),
+            stage_counts=dict(metrics.counts),
+            error_type="FileLimitReached" if scan.truncated else None,
+            error_message="max_files_per_project reached; project index is incomplete" if scan.truncated else None,
+        )
 
     def _preserved_screenshot(self, previous_asset: dict[str, Any] | None) -> tuple[str, str | None]:
         """Keep a user-imported screenshot when a UI source file is reindexed."""
@@ -927,5 +1411,29 @@ class IndexStore:
         with connect(self.cfg.db_path, readonly=True) as conn:
             counts = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in ("projects", "files", "symbols", "capabilities", "ui_assets", "index_runs", "index_errors")}
             last = conn.execute("SELECT * FROM index_runs ORDER BY run_id DESC LIMIT 1").fetchone()
-        return {"status": "ok", "db": str(self.cfg.db_path), "counts": counts, "last_index": dict(last) if last else None}
+            progress = []
+            if last:
+                progress = [dict(row) for row in conn.execute("SELECT * FROM index_project_runs WHERE run_id=? ORDER BY ordinal", (last["run_id"],)).fetchall()]
+        last_dict = dict(last) if last else None
+        if last_dict:
+            for key in ("stage_timings_json", "stage_counts_json"):
+                raw = last_dict.get(key)
+                try:
+                    last_dict[key.removesuffix("_json")] = json.loads(raw or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    last_dict[key.removesuffix("_json")] = {}
+        for item in progress:
+            for key in ("stage_timings_json", "stage_counts_json"):
+                raw = item.get(key)
+                try:
+                    item[key.removesuffix("_json")] = json.loads(raw or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    item[key.removesuffix("_json")] = {}
+        return {
+            "status": "ok",
+            "db": str(self.cfg.db_path),
+            "counts": counts,
+            "last_index": last_dict,
+            "project_progress": progress,
+        }
 

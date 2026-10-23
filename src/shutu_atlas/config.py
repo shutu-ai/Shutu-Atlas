@@ -11,6 +11,7 @@ DEFAULT_EXCLUDED_DIRS = {
     "coverage", ".pytest_cache", "__pycache__", ".mypy_cache", ".ruff_cache",
     ".next", ".cache", ".pnpm-store", ".yarn", ".gradle", ".idea", ".vscode", ".turbo",
     ".parcel-cache", ".codex", ".opencode", ".serena", ".agent", ".agents", "target", "bin", "obj", "vendor", "tmp", "temp", "cache", "logs", "out",
+    ".codegraph", ".go-cache", ".go-mod-cache", ".deploy-staging", "pytest-cache-files",
 }
 
 
@@ -22,6 +23,7 @@ class Limits:
     max_snippet_lines: int = 12
     max_chars: int = 8_000
     command_timeout_seconds: float = 8.0
+    changed_only_hash_mode: str = "stat"
 
 
 @dataclass(slots=True)

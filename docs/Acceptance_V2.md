@@ -1,122 +1,139 @@
-# Shutu-Atlas V2 remediation and acceptance closure
+# Shutu-Atlas V2 final performance and Agent acceptance
 
 Date: 2026-10-23
+Branch: `main`
+Final disposition: `PARTIAL / BLOCKED_ENV`
+V2 READY: `NO`
 
-## Final disposition
+The implementation is complete for the requested V2 lifecycle work, but the
+live workspace is not a clean `READY` gate: discovery currently returns 44
+eligible projects (the earlier 38-project expectation is stale), two projects
+exceed the configured 20,000-file safety limit, and the daily Python
+environment does not contain the official MCP SDK or Serena. No source
+repository was written.
 
-Overall status: `PARTIAL` / `BLOCKED_ENV`. The security boundary fixes and
-the read-only query, Gallery, official MCP, Serena, and Skill integration
-tests pass. This is not `READY` because the real `D:\dev-projects` index run
-was interrupted before all discovered projects were covered, and OpenCode
-client loading remains `UNVERIFIED`.
+## A01-A10 gates
 
-No known P0/P1 sensitive-file or source-write boundary failure remains in the
-automated test scope. The incomplete full-workspace index must not be described
-as full coverage.
-
-## A01-A10 evidence
-
-| ID | Status | Evidence |
+| Gate | Status | Evidence |
 | --- | --- | --- |
-| A01 source repositories are not rewritten | `PASS` | Serena ran against a Hub-owned mirror; `tests/test_serena_optional.py` asserts the fixture source has no `.serena`. The adapter copies only the shared allowed file set and never exposes a write call. |
-| A02 discovery and full indexing | `BLOCKED_ENV` | Dry-run discovered 39 candidates under `D:\dev-projects`; configured exclusion removes `Shutu-Atlas`, leaving 38 eligible. Full `run_id=8` covered 15 projects and 8,607 files before interruption; `run_id=9` changed-only covered the same 15 projects with 0 changed files before interruption. Both had 0 project errors. DB size at the end was 343,285,760 bytes. |
-| A03 code/capability/source queries | `PASS` | FTS5, restricted ripgrep, project filtering, bounded source reads, Git metadata, and static symbol fallback are covered by `tests/test_index.py` and `tests/test_symbols_mcp.py`. |
-| A04 incremental lifecycle | `PASS` | `test_incremental_change_and_remove`, `test_ui_asset_identity_and_screenshot_survive_full_and_incremental_refresh`, stale-run recovery, and removed-project pruning pass. |
-| A05 Serena | `PASS` (isolated) | `.local/integration-venv`: `serena-agent 2.1.0`, official `mcp 2.2.0`, `uv 0.13.5`; real Serena stdio startup, Pyright startup, `TaskStore` symbol query, mirror mapping, and source-project no-write assertion pass. The default Python environment remains truthfully `BLOCKED_ENV`. |
-| A06 Gallery | `PASS` | API screenshot bytes/content type and all-project code search pass in `test_gallery_api_screenshot_preview_and_all_project_code_search`; opt-in elevated Playwright preview/detail/copy/all-project interaction passes 2 tests. |
-| A07 official read-only MCP | `PASS` | Official `mcp.Client` stdio session lists Atlas tools and calls `atlas_health`; `tests/test_mcp_sdk_optional.py` passes. Atlas exposes no index refresh, shell, Git, source-write, or Gallery-write tool. |
-| A08 local-project-reuse Skill / clients | `PASS` for Skill; `UNVERIFIED` for OpenCode | `test_local_project_reuse_skill_real_mcp_e2e` calls health, project/capability/code/source tools through a real MCP client, then runs a minimal feature in a fresh disposable target project. OpenCode CLI was present but its log open failed with `EPERM`; no user configuration was changed. |
-| A09 security and evidence freshness | `PASS` | Sensitive credentials/key/hidden files, excluded directories, symlinks/reparse points, cross-project isolation, source bounds, manual verification expiry, legacy UI IDs, and reuse-risk fields are covered by `tests/test_index.py`. |
-| A10 documentation and regression closure | `PASS` with known blockers | Base regression is `15 passed, 5 skipped`; isolated integration is `4 passed`; elevated Gallery browser E2E is `2 passed`; `node --check web/app.js` and `git diff --check` pass. Updated MCP/Skill and Windows operations docs are included. |
+| A01 source repositories remain read-only | `PASS` | `src/shutu_atlas/discovery.py:368-432` applies the shared safe-file predicate; index/gallery/MCP state is under `.local`. The run did not write any source project. |
+| A02 discovery and full live indexing | `PARTIAL` | `scan-instrumented-v2.json` and run 20 discovered 44 projects. Run 20 reached terminal status for all 44: 42 complete/resumed projects and two explicit `FileLimitReached` partials. It is not described as full 44-project coverage. |
+| A03 code/capability/source evidence | `PASS` | FTS5 plus bounded ripgrep, project isolation, source bounds, Git metadata, and evidence status are covered by `tests/test_index.py` and the MCP tests. |
+| A04 incremental lifecycle | `PASS` | Change, delete, rename, UI preservation, stale-run recovery, stat fast path, force-hash, and checkpoint tests pass. |
+| A05 Serena and official Python MCP SDK in daily env | `BLOCKED_ENV` | `.local/doctor-default-v2-final.json`: `C:\Python314\python.exe` 3.14.7, `python_mcp_sdk=false`, Serena absent. `.local/doctor-venv-v2-final.json`: `.venv` Python 3.13.15 with the same missing optional packages. The compatibility stdio server is available; official SDK/Serena remain optional evidence only. |
+| A06 Gallery | `PASS` | Existing API/browser evidence remains valid; current regression suite passes the Gallery API path and the existing elevated browser evidence is retained. |
+| A07 read-only MCP surface | `PASS` for the compatibility stdio surface; `BLOCKED_ENV` for official SDK | Direct MCP initialize succeeded after the index writer stopped. The server exposes query tools only; no refresh, shell, Git-write, source-write, or Gallery-write tool exists. |
+| A08 local-project-reuse Skill and clients | `PASS` for real Codex CLI; `UNVERIFIED` for OpenCode | `.local/codex-e2e-20261023-retry/codex-events.jsonl` records the actual Codex CLI sequence: Skill load, `atlas_health`, `atlas_find_capability`, `atlas_search_code`, `atlas_get_source`, code generation, and pytest. OpenCode `v2.1.3` is installed, but the prior real client attempt hit `EPERM` while opening its log; no user config workaround was attempted. |
+| A09 security and evidence freshness | `PASS` | Sensitive-file filtering, hidden/excluded directories, reparse points, cross-project isolation, source bounds, Git/evidence freshness, legacy UI IDs, and reuse-risk fields remain covered. |
+| A10 documentation and regression closure | `PASS` with A02/A05/A08 caveats | `python -m pytest -q` => `19 passed, 5 skipped in 55.90s`; `.local/pytest-v2-final.txt` records the run. |
 
-## Remediations and files
+## Implementation evidence
 
-| Finding | Implementation evidence |
-| --- | --- |
-| `_rg_search()` bypassed sensitive-file rules | `src/shutu_atlas/discovery.py`: `is_sensitive`, `safe_source_path`, `allowed_source_path`, and `iter_project_files`; `src/shutu_atlas/index/database.py`: `_rg_search`, FTS/source validation. Index, ripgrep, and source reads now share one allowed-file predicate. |
-| Sensitive files, hidden files, excluded dirs, and symlinks | `tests/fixtures/fixture-secrets/` and `test_allowed_file_set_is_shared_by_index_fts_rg_and_source_reads`. Reparse points are rejected before path resolution. |
-| UI IDs collided across repositories | `database.py`: project-scoped `_ui_asset_id`, schema version 4, `ui_asset_aliases`, `_migrate_ui_asset_ids`, and alias resolution. `test_legacy_ui_asset_id_migration_preserves_alias_and_screenshot` and the multi-repo fixture prove compatibility and coexistence. |
-| Gallery all-project query passed an empty project filter | `database.py` normalizes empty project IDs; `web/app.js` omits the filter for “all projects”; API and browser tests cover it. |
-| Gallery did not display imported screenshots | `api/server.py`, `database.py` screenshot URL/detail support, `web/app.js`, and `web/styles.css` implement real thumbnails, detail preview, prompt copy, and safe fallback. |
-| Full/incremental refresh lost screenshots | `database.py`: `_preserved_screenshot` plus conflict-safe UI upsert; full and changed-only regression test passes. |
-| Manual `verified` status was not source-bound | `database.py`: `manual_git_head`, `manual_evidence_hash`, live evidence fingerprint, `expired` status and warning; `test_manual_verification_expires_when_evidence_changes` passes. |
-| `suggest-reuse` overclaimed keyword matches | `database.py`: stack, dependency clues, evidence source, adaptation risk, target-stack match, and reuse type; CLI/MCP route through the enriched method. |
-| Official integrations were unverified/incompatible | `requirements-integrations.txt` and `pyproject.toml` pin the compatible set `mcp[cli]==2.2.0`, `serena-agent==2.1.0`, `uv==0.13.5`; `symbols/providers.py` uses official MCP tools, isolated `SERENA_HOME`/`UV_CACHE_DIR`, mirror mapping, and Serena 2.1.0 result parsing. |
+| Area | Real path and lines | Result |
+| --- | --- | --- |
+| Stage timing/count model | `src/shutu_atlas/index/metrics.py:10-48` | Reproducible monotonic stage timings and counters. |
+| Discovery/Git instrumentation | `src/shutu_atlas/discovery.py:105-330` | Discovery, stat/path checks, stack detection, Git commands, and directory traversal are recorded. |
+| Shared stat-first file scan | `src/shutu_atlas/discovery.py:368-494` | One walk collects stat metadata, eligible totals, bytes, skipped counts, and limit evidence while preserving sensitive/reparse filtering. |
+| Index lifecycle/checkpoints | `src/shutu_atlas/index/database.py:119-153,439-670` | Run/project checkpoints, stale-owner recovery, resume, retry, per-project commit, and terminal error state. |
+| FTS row identity | `src/shutu_atlas/index/database.py:719-754` | `fts_content_rows` prevents unnecessary FTS row scans during replacement/deletion. |
+| CLI controls | `src/shutu_atlas/cli.py:45-65,192` | `--changed-only`, `--force-hash`, `--resume`, `--retry-project`, and overall elapsed output. |
 
-## Test evidence
+## Correctness and performance
 
-```text
+Ordinary incremental mode (`changed_only_hash_mode = "stat"`) first compares
+stored size and nanosecond mtime. If both match, it does not hash or read the
+file and records it as unchanged. This is fast but cannot detect a same-size
+content rewrite that preserves mtime. `--force-hash` hashes every eligible
+file; it is the strong-validation mode and detects that case. A forced hash
+run is intentionally slower.
+
+| Workload | Old evidence | V2 evidence |
+| --- | ---: | ---: |
+| Deepseek no-change, 5123 files | Run 9 used the old always-hash path and ran about 26m45s across 15 projects before interruption | `benchmark-deepseek-stat-v4.json`: 1869 ms project time, 0 hashes; v5: 3243 ms, 0 hashes |
+| Same workload with strong validation | Not separately measured | `benchmark-deepseek-force-hash.json`: 22636 ms project time, 5123 hashes, 20090 ms SHA-256 |
+| Live discovery | Old report: 39 candidates | V2: 44 projects, 17 Git projects, 61 Git commands, 8568.498 ms in final run |
+| Final live run | Earlier runs stopped after 11/17 projects | Run 20: 44/44 terminal checkpoints, 87610 files scanned, 1,077,329,312 bytes, 3287 changed/indexed files, 36634 unchanged files, 2 explicit partials, 751667.894 ms overall |
+
+The first run 19 also provided the root cause evidence for the last-project
+stall: `znexus-dashboard-demo-v3` contained `.codegraph`, `.go-cache`,
+`.go-mod-cache`, `.deploy-staging*`, and `pytest-cache-files-*`; the process
+reported 566,836,543,428 bytes read before interruption while that project had
+no checkpoint. Those names are now excluded by the normal directory predicate.
+Run 20 resumed the 43 completed checkpoints and finished the last project in
+679147.256 ms.
+
+The ordinal-16 project `eli5-business-suite` is a resumed, unchanged project
+with a small stat-only checkpoint; it is not the source of the long tail. The
+long running cases were content-heavy changed/new projects and the cache
+directories above.
+
+## Final live project errors
+
+These are real terminal errors from run 20, not timeouts:
+
+| Project | Real path | Eligible files | Scanned bytes | Skipped count | Error |
+| --- | --- | ---: | ---: | ---: | --- |
+| `High-End_Feature_Phones` | `D:\dev-projects\High-End_Feature_Phones` | 24622 | 356754893 | 27311 | `FileLimitReached`: 24622 eligible files exceed `max_files_per_project=20000`; 4622 over-limit files. |
+| `webnovel-Agent2` | `D:\dev-projects\webnovel-Agent2` | 23067 | 118846609 | 10043 | `FileLimitReached`: 23067 eligible files exceed `max_files_per_project=20000`; 3067 over-limit files. |
+
+For both projects the partial path performed zero content/FTS writes for the
+oversized project and retained the error in `index_errors`. The remaining 42
+projects have usable committed results; the final run status remains
+`partial` until the file-cap decision is explicitly changed.
+
+## Recovery and retry evidence
+
+- Run 16 stopped after 11 project checkpoints.
+- Run 17 used `resume_from_run=16`, preserved prior results, and completed the
+  next project without redoing the first 11 content indexes.
+- Run 19 stopped after 43 checkpoints while the last project was active.
+- Run 20 used `resume_from_run=19`, restored 37 project checkpoints as
+  `resumed`, rechecked them with stat metadata, and finished all 44 projects.
+- Project-level retry is available through `--retry-project NAME_OR_ID`; it
+  does not prune unrelated roots and does not hide project errors.
+
+## Real Codex CLI E2E
+
+The retry E2E target is a fresh Git repository at
+`.local/codex-e2e-20261023-retry` with seed HEAD
+`9a898a332fc02f4b2249be7d058d844c86f3d7c8`.
+
+The actual command was `codex exec` with a one-shot `shutu-atlas` MCP override;
+the user config was not edited. Codex read
+`skills/local-project-reuse/SKILL.md`, then called:
+
+1. `atlas_health`
+2. `atlas_find_capability(query="任务重启恢复", limit=3)` (no result)
+3. `atlas_find_capability(query="recover after restart", limit=3)`
+4. `atlas_search_code(query="recover_after_restart", project_id="aeac851c36b9a320", limit=3)` (no exact result)
+5. `atlas_get_source(project_id="aeac851c36b9a320", file_id=2329, start_line=362, end_line=374)`
+6. additional bounded search/symbol checks, with Serena truthfully reported as
+   `BLOCKED_ENV`.
+
+The source evidence returned
+`D:\dev-projects\English-Practice\benchmark.go:362-373`, Git HEAD
+`f80ceeee2b7932ccaba962f942c00a71ee850078`, branch `main`, and only a
+`PostProbeRecovery` metric field at line 366. Codex correctly classified the
+old capability as `inferred/unverified`, not as a reusable implementation.
+It then added only `reused_app.py` and `test_reused_app.py` in the disposable
+target and ran `python -m pytest -q` => `4 passed in 0.20s`.
+
+## Reproducible commands
+
+```powershell
+$env:PYTHONPATH = (Resolve-Path 'src').Path
+python -m shutu_atlas.cli --config .\atlas.toml scan --root D:\dev-projects --dry-run
+python -m shutu_atlas.cli --config .\atlas.toml index --root D:\dev-projects --changed-only --resume
+python -m shutu_atlas.cli --config .\atlas.toml status
 python -m pytest -q
-15 passed, 5 skipped in 60.33s
-
-python -m pytest -q tests/test_mcp_sdk_optional.py tests/test_serena_optional.py tests/test_skill_e2e.py
-4 passed in 41.00s  (isolated integration environment, elevated stdio permissions)
-
-$env:SHUTU_ATLAS_BROWSER_E2E = '1'
-python -m pytest -q tests/test_gallery_frontend.py
-2 passed in 9.66s  (elevated Chromium E2E)
-
-node --check web/app.js
-PASS
-
-python -m shutu_atlas.cli doctor
-SQLite FTS5: PASS; ripgrep: PASS; default Python MCP/Serena: BLOCKED_ENV;
-OpenCode executable present but client invocation: UNVERIFIED.
 ```
 
-Installed integration versions were checked with `pip show` and the CLI:
-
-```text
-mcp 2.2.0
-serena-agent 2.1.0
-uv 0.13.5
-Serena 2.1.0-090dab18-dirty
-```
-
-## Index lifecycle and disk evidence
-
-The discovery command returned 39 candidates. The configured target repository
-was excluded, so the expected eligible count was 38.
-
-| Run | Mode | Started (UTC) | Finished (UTC) | Projects seen | Files indexed | Errors | Status |
-| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
-| 8 | full | 2026-10-23T13:10:41Z | 2026-10-23T15:32:09Z | 15 | 8,607 | 0 | `interrupted` |
-| 9 | changed-only | 2026-10-23T15:32:29Z | 2026-10-23T15:59:14Z | 15 | 0 | 0 | `interrupted` |
-
-The timings are approximately 2h21m28s and 26m45s. The stored database was
-343,285,760 bytes at the final status check. Other project-local evidence
-sizes were `.local/integration-venv` 182,005,499 bytes and `.local/test-work`
-159,028,434 bytes; the project Gallery and root Serena workspace were empty at
-that point. The partial index remains usable for already committed projects,
-but it is not a full-workspace coverage claim.
-
-## Remaining blockers and rerun command
-
-1. `A02 BLOCKED_ENV`: the largest remaining discovered project(s) exceed the
-   practical verification window under the current per-file SQLite/FTS
-   implementation. Resume with:
-
-   ```powershell
-   $env:PYTHONPATH = (Resolve-Path 'src').Path
-   python -m shutu_atlas.cli index --root D:\dev-projects --changed-only
-   python -m shutu_atlas.cli status
-   ```
-
-   Accept only a returned `status=ok` run whose `projects_seen` equals the
-   eligible discovered count; until then the index is partial.
-2. `OpenCode UNVERIFIED`: the CLI attempted to open
-   `C:\Users\swx1536744\.local\share\opencode\log\opencode.log` and received
-   `EPERM`. No user-level config/log permission workaround was attempted.
-3. The default Python environment intentionally remains optional-dependency
-   free; official SDK/Serena evidence is available only in the isolated
-   `.local/integration-venv`.
+Use `--force-hash` when same-size/same-mtime rewrites must be detected. Use
+`--retry-project NAME_OR_ID` for a bounded project retry. Do not describe a
+`partial` or `interrupted` run as full coverage.
 
 ## Git handoff
 
-Implementation commit: `8f925eb9023169c23220edea7a0b4d3b47779d83`
-
-Only `D:\dev-projects\Shutu-Atlas` and its test fixtures were changed. No
-reference source project was edited, built, migrated, or used as a write
-The implementation commit contains the code, tests, fixtures, integration
-requirements, and this acceptance report. A follow-up documentation commit
-will record the final report reference.
+The final implementation and evidence changes are committed and pushed after
+the verification pass. The final commit hash is recorded here immediately
+before handoff.

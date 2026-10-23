@@ -36,17 +36,33 @@ def _print(payload: object) -> None:
 
 def cmd_scan(args: argparse.Namespace) -> int:
     cfg = _config(args)
-    projects = discover_projects(cfg)
-    _print({"status": "dry-run" if args.dry_run else "discovered", "source_roots": [str(p) for p in cfg.roots], "projects": [p.to_dict() for p in projects], "count": len(projects), "writes": []})
+    discovery = {}
+    projects = discover_projects(cfg, discovery)
+    _print({"status": "dry-run" if args.dry_run else "discovered", "source_roots": [str(p) for p in cfg.roots], "projects": [p.to_dict() for p in projects], "count": len(projects), "discovery": discovery, "writes": []})
     return 0
 
 
 def cmd_index(args: argparse.Namespace) -> int:
     cfg = _config(args)
-    projects = discover_projects(cfg)
-    result = IndexStore(cfg).index(projects, changed_only=args.changed_only)
+    discovery = {}
+    projects = discover_projects(cfg, discovery)
+    configured_force_hash = cfg.limits.changed_only_hash_mode.casefold() in {"force", "force-hash", "hash", "strong"}
+    result = IndexStore(cfg).index(
+        projects,
+        changed_only=args.changed_only,
+        force_hash=args.force_hash or configured_force_hash,
+        resume=args.resume,
+        retry_projects=args.retry_project,
+        discovery_report=discovery,
+    )
     result["source_roots"] = [str(p) for p in cfg.roots]
     result["discovered"] = len(projects)
+    result["discovery"] = discovery
+    result["overall_elapsed_ms"] = round(
+        float(result.get("elapsed_ms", 0.0))
+        + float(discovery.get("timings_ms", {}).get("total", 0.0)),
+        3,
+    )
     _print(result)
     return 0 if result["errors"] == 0 else 2
 
@@ -173,7 +189,7 @@ def parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     doctor = sub.add_parser("doctor"); doctor.set_defaults(func=cmd_doctor)
     scan = sub.add_parser("scan"); scan.add_argument("--root"); scan.add_argument("--dry-run", action="store_true"); scan.set_defaults(func=cmd_scan)
-    index = sub.add_parser("index"); index.add_argument("--root"); index.add_argument("--changed-only", action="store_true"); index.add_argument("--include-project", action="append", default=[], help="只索引指定 project name 或 project_id，可重复"); index.set_defaults(func=cmd_index)
+    index = sub.add_parser("index"); index.add_argument("--root"); index.add_argument("--changed-only", action="store_true"); index.add_argument("--force-hash", action="store_true", help="changed-only 下强制校验所有候选文件 SHA-256；比 stat 模式更慢但可检测保持 mtime/size 的内容变化"); index.add_argument("--resume", action="store_true", help="从最近一次中断的同模式运行恢复，先用 stat 校验已完成项目"); index.add_argument("--retry-project", action="append", default=[], help="只重试指定 project name 或 project_id，可重复"); index.add_argument("--include-project", action="append", default=[], help="只索引指定 project name 或 project_id，可重复"); index.set_defaults(func=cmd_index)
     ls = sub.add_parser("list-projects"); ls.add_argument("--filter"); ls.add_argument("--limit", type=int, default=50); ls.set_defaults(func=cmd_list_projects)
     search = sub.add_parser("search-code"); search.add_argument("query"); search.add_argument("--limit", type=int, default=10); search.add_argument("--project"); search.add_argument("--language"); search.set_defaults(func=cmd_search)
     cap = sub.add_parser("find-capability"); cap.add_argument("query"); cap.add_argument("--limit", type=int, default=10); cap.add_argument("--project"); cap.set_defaults(func=cmd_capability)

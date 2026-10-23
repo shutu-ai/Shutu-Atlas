@@ -62,3 +62,45 @@ never used as the storage location for the index or Serena state.
   delete an active database or journal.
 - No screenshot: this is the safe default. Import an explicitly supplied
   image with `atlas gallery import-screenshot --asset-id ... --path ...`.
+
+## V2 performance and recovery controls
+
+Every scan/index result now includes stage timings and counters for discovery,
+Git status, path checks, directory traversal, stat, SHA-256, source reads,
+symbol/capability detection, SQLite writes, and FTS writes. Each project
+checkpoint records file count, scanned bytes, skipped count, changed and
+unchanged counts, elapsed time, status, and error details.
+
+The ordinary changed-only path is stat-first:
+
+```powershell
+atlas index --changed-only
+```
+
+It compares stored size and nanosecond mtime and does not hash unchanged files.
+Use the stronger content-validation mode when same-size/same-mtime rewrites are
+possible:
+
+```powershell
+atlas index --changed-only --force-hash
+```
+
+The strong mode hashes every eligible file and is expected to be slower. A run
+that is interrupted can be continued without repeating completed project
+content indexing:
+
+```powershell
+atlas index --changed-only --resume
+atlas index --changed-only --retry-project PROJECT_NAME_OR_ID
+atlas status
+```
+
+`partial` is a real terminal status. The default
+`max_files_per_project = 20000` is a safety limit; an oversized project is
+recorded with its actual eligible file count, bytes, skipped count, and
+`FileLimitReached` error. It must not be reported as complete.
+
+Cache/generated directories such as `.codegraph`, `.go-cache`,
+`.go-mod-cache`, `.deploy-staging*`, and `pytest-cache-files-*` are excluded
+from source traversal. This is a source-boundary/performance rule, not a
+timeout.
