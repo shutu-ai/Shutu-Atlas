@@ -15,12 +15,22 @@ atlas index --root D:\dev-projects
 atlas list-projects
 atlas search-code "task recovery" --limit 10
 atlas find-capability "任务重启恢复"
+atlas suggest-reuse "Vue ECharts KPI dashboard" --target-stack "Vue 3 + TypeScript" --limit 3
+atlas confirm-capability --project <project-id> --name task_recovery --status verified --note "人工核对源码与测试证据"
 atlas find-symbol submit_sm --project <project-id>
 atlas find-ui "dark KPI dashboard" --limit 12
 atlas gallery serve --host 127.0.0.1 --port 8765
 atlas mcp serve --transport stdio
 atlas status
 ```
+
+官方 MCP SDK 与 Serena 仅在明确批准、网络可用时安装到本项目虚拟环境：
+
+```powershell
+.\scripts\install.ps1 -WithIntegrations
+```
+
+版本锁定在 [`requirements-integrations.txt`](requirements-integrations.txt)。基础安装不依赖它们，缺失时会使用明确标记的兼容 stdio 和静态符号 fallback。
 
 没有安装 editable package 时可用 `python -m shutu_atlas.cli ...`。`atlas scan --dry-run` 不创建数据库，也不在源项目写入文件；`atlas index` 只写 `.local`。
 
@@ -30,6 +40,7 @@ atlas status
 - 默认排除 `.git`、环境文件、密钥/证书、依赖目录、构建产物、缓存和过大的二进制文件。
 - `atlas get_source` 只能通过已索引的 `project_id + file_id` 读取受限行范围，并返回当前哈希是否过期。
 - Serena 采用 Hub 内镜像边界；本机没有 Serena 时，符号查询明确返回 `DEGRADED/BLOCKED_ENV` 并使用静态符号 fallback。
+- 能力候选默认是 `inferred`；用户可用 `confirm-capability` 在 Hub 数据库中维护 `verified/inferred/unverified` 和审核备注，审核元数据不会写入源项目。
 - 本机没有官方 Python MCP SDK 时，内置的是兼容 MCP JSON-RPC stdio 协议的只读服务；`atlas_health` 会明确报告 SDK 状态，不冒充 SDK 集成通过。
 - Gallery 是标准库只读 HTTP 服务。没有真实截图时显示“未采集截图”，不会生成合成图片；可用 `gallery import-screenshot` 导入用户主动指定的真实截图。
 

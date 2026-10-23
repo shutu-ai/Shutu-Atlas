@@ -102,6 +102,37 @@ def cmd_capability(args: argparse.Namespace) -> int:
     return 0 if store else 2
 
 
+def cmd_confirm_capability(args: argparse.Namespace) -> int:
+    store = _store_or_empty(_config(args))
+    if not store:
+        _print({"status": "unavailable", "warnings": ["index not initialized"]})
+        return 2
+    result = store.confirm_capability(args.project, args.name, args.status, args.label, args.note)
+    _print(result)
+    return 0 if result.get("status") == "ok" else 2
+
+
+def cmd_suggest_reuse(args: argparse.Namespace) -> int:
+    store = _store_or_empty(_config(args))
+    if not store:
+        _print({"status": "unavailable", "warnings": ["index not initialized"]})
+        return 2
+    limit = min(max(1, args.limit), 3)
+    capability = store.find_capability(args.requirement, limit)
+    ui = store.find_ui(args.requirement, limit)
+    _print({
+        "status": "ok",
+        "source": "indexed-evidence",
+        "requirement": args.requirement,
+        "target_stack": args.target_stack,
+        "candidates": capability.get("results", [])[:3],
+        "ui_candidates": ui.get("results", [])[:3],
+        "reuse_types": ["reuse_direct", "adapt", "visual_reference", "unknown"],
+        "warnings": ["候选是静态证据；实施前请核验依赖、许可证和测试"],
+    })
+    return 0
+
+
 def cmd_symbol(args: argparse.Namespace) -> int:
     store = _store_or_empty(_config(args))
     if not store:
@@ -158,6 +189,8 @@ def parser() -> argparse.ArgumentParser:
     ls = sub.add_parser("list-projects"); ls.add_argument("--filter"); ls.add_argument("--limit", type=int, default=50); ls.set_defaults(func=cmd_list_projects)
     search = sub.add_parser("search-code"); search.add_argument("query"); search.add_argument("--limit", type=int, default=10); search.add_argument("--project"); search.add_argument("--language"); search.set_defaults(func=cmd_search)
     cap = sub.add_parser("find-capability"); cap.add_argument("query"); cap.add_argument("--limit", type=int, default=10); cap.add_argument("--project"); cap.set_defaults(func=cmd_capability)
+    confirm = sub.add_parser("confirm-capability", help="维护 Hub 内的能力人工审核元数据"); confirm.add_argument("--project", required=True); confirm.add_argument("--name", required=True); confirm.add_argument("--status", required=True, choices=["verified", "inferred", "unverified"]); confirm.add_argument("--label"); confirm.add_argument("--note"); confirm.set_defaults(func=cmd_confirm_capability)
+    reuse = sub.add_parser("suggest-reuse", help="比较能力与 UI 参考候选"); reuse.add_argument("requirement"); reuse.add_argument("--target-stack"); reuse.add_argument("--limit", type=int, default=3); reuse.set_defaults(func=cmd_suggest_reuse)
     symbol = sub.add_parser("find-symbol"); symbol.add_argument("name"); symbol.add_argument("--project"); symbol.add_argument("--kind"); symbol.set_defaults(func=cmd_symbol)
     ui = sub.add_parser("find-ui"); ui.add_argument("query", nargs="?", default="dashboard"); ui.add_argument("--limit", type=int, default=12); ui.add_argument("--project"); ui.set_defaults(func=cmd_ui)
     status = sub.add_parser("status"); status.set_defaults(func=cmd_status)

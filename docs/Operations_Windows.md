@@ -10,6 +10,14 @@ notepad atlas.toml
 atlas doctor
 ```
 
+如需执行官方 SDK/Serena 集成测试，并已获准联网安装，可使用：
+
+```powershell
+.\scripts\install.ps1 -WithIntegrations
+```
+
+该开关只写项目内 `.venv`；直接依赖版本锁定在 `requirements-integrations.txt`。当前验收环境的 PyPI 连接返回 WinError 10013，因此未将阻塞伪装成通过。
+
 脚本只在项目内创建 `.venv` 和 `atlas.toml`；不会修改用户 Codex/OpenCode 配置。运行 `scripts\install-skill.ps1` 默认只是 dry-run；用户明确确认后才使用 `-Install -DryRun:$false`，已有 Skill 会先备份。
 
 ## 更新与增量
@@ -18,6 +26,7 @@ atlas doctor
 atlas scan --root D:\dev-projects --dry-run
 atlas index --root D:\dev-projects
 atlas index --changed-only
+atlas confirm-capability --project <project-id> --name task_recovery --status verified --note "人工核对源码与测试证据"
 atlas status
 ```
 

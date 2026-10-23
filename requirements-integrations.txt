@@ -1,0 +1,5 @@
+# Optional, isolated verification dependencies.  The base package remains
+# stdlib-only and keeps a truthful compatibility transport when these are
+# unavailable.
+mcp[cli]==2.3.0
+serena-agent==2.1.0

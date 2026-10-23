@@ -10,6 +10,11 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+# Keep the default install offline-friendly; use the pinned requirements file
+# for an explicitly approved official SDK/Serena verification environment.
+integrations = ["mcp[cli]==2.3.0", "serena-agent==2.1.0"]
+
 [project.scripts]
 atlas = "shutu_atlas.cli:main"
 
@@ -20,7 +25,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests/test_index.py", "tests/test_symbols_mcp.py", "tests/test_mcp_sdk_optional.py"]
+testpaths = ["tests/test_index.py", "tests/test_symbols_mcp.py", "tests/test_mcp_sdk_optional.py", "tests/test_serena_optional.py"]
 norecursedirs = ["fixtures", ".test-tmp", ".test-work"]
 addopts = "-p no:cacheprovider"
 pythonpath = ["src"]

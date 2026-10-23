@@ -7,8 +7,8 @@
 - `D:\dev-projects` 一级目录总数：48。
 - 排除隐藏工具目录和本项目后，外部一级目录：41。
 - M0 首轮一级目录发现器识别 27 个候选，其中 Git 根 12 个、普通源码目录 15 个；随后加入嵌套源码项目识别后，当前 `atlas scan --dry-run` 返回 39 个候选。两者差异来自嵌套项目拆分，不是源目录被改写。
-- Git 项目的状态基线：3 个 clean、9 个 dirty；`git status` 只读采集，dirty 是源项目原有状态，不由 Shutu-Atlas 修改。
-- Git 根中 `High-End_Feature_Phones` 能检测到 `.git`，但当前没有可读 HEAD；这被保留为真实的 Git 元数据缺失，而不是伪造提交。
+- 当前嵌套感知扫描识别 17 个 Git-root 候选，其中 16 个有可读 HEAD、4 个 clean、12 个 dirty；`git status` 只读采集，dirty 是源项目原有状态，不由 Shutu-Atlas 修改。
+- Git-root 候选中 `High-End_Feature_Phones` 能检测到 `.git`，但当前没有可读 HEAD；这被保留为真实的 Git 元数据缺失，而不是伪造提交。
 
 代表性真实项目和技术栈：
 
@@ -29,7 +29,7 @@
 | 工具 | 实测状态 |
 | --- | --- |
 | Windows | 可用（PowerShell） |
-| Python | `3.14.7` |
+| Python | `3.14.6`（当前 `atlas doctor`） |
 | Git | `2.55.0.windows.3` |
 | ripgrep | `15.2.0` |
 | Node/npm | `v24.19.0` / `12.0.2` |

@@ -14,7 +14,7 @@ D:\dev-projects (只读)
 
 ## 数据层
 
-`projects` 保存路径、稳定 `project_id`、Git HEAD/branch/dirty；`files` 保存相对路径、语言、大小、修改时间和 SHA-256；`symbols` 保存受支持语言的静态定义；`capabilities` 与 `capability_evidence` 将关键词线索映射回真实文件行；`ui_assets` 与 `ui_source_links` 保存 UI 文件、特征和截图状态；`fts_content` 是 SQLite FTS5 召回表，源码正文受大小上限约束。
+`projects` 保存路径、稳定 `project_id`、Git HEAD/branch/dirty；`files` 保存相对路径、语言、大小、修改时间和 SHA-256；`symbols` 保存受支持语言的静态定义；`capabilities` 与 `capability_evidence` 将关键词线索映射回真实文件行，`manual_*` 字段保存 Hub 内人工审核而不是源项目修改；`ui_assets` 与 `ui_source_links` 保存 UI 文件、特征和截图状态；`fts_content` 是 SQLite FTS5 召回表，源码正文受大小上限约束。
 
 索引按项目处理并在一个数据库事务中提交；单项目异常会写入 `index_errors`，不破坏其他已提交项目。变化判断使用哈希、大小和修改时间；删除文件会清理其符号、证据、UI 映射和 FTS 记录。
 

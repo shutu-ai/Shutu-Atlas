@@ -17,7 +17,12 @@ def test_official_mcp_sdk_stdio_client():
     async def exercise():
         project_root = Path(__file__).parents[1].resolve()
         env = dict(os.environ)
-        env["PYTHONPATH"] = str(project_root / "src")
+        optional_deps = project_root / ".local" / "python-deps"
+        env["PYTHONPATH"] = os.pathsep.join(
+            str(path)
+            for path in (optional_deps, project_root / "src")
+            if path.exists()
+        )
         server = StdioServerParameters(command=sys.executable, args=["-m", "shutu_atlas.cli", "mcp", "serve", "--transport", "stdio"], env=env)
         async with Client(server) as client:
             tools = await client.list_tools()

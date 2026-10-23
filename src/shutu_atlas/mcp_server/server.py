@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import importlib.util
+import asyncio
 import sys
 from typing import Any
 
@@ -54,7 +56,11 @@ class McpService:
             result = self.store.status()
             result["rg"] = {"available": __import__("shutil").which("rg") is not None}
             result["serena"] = self.serena.health()
-            result["mcp_sdk"] = {"available": __import__("importlib.util").util.find_spec("mcp") is not None, "mode": "compat-stdio"}
+            sdk_available = official_sdk_available()
+            result["mcp_sdk"] = {
+                "available": sdk_available,
+                "mode": "official-lowlevel" if sdk_available else "compat-stdio",
+            }
             result["gallery"] = {"path": str(self.store.cfg.gallery_dir), "read_only_api": True}
             return result
         raise ValueError(f"unknown tool: {name}")
@@ -90,7 +96,71 @@ def handle_message(service: McpService, message: dict[str, Any]) -> dict[str, An
     return None
 
 
-def run_stdio(cfg: AtlasConfig) -> None:
+def official_sdk_available() -> bool:
+    """Return whether the installed MCP package is available to the process."""
+
+    return importlib.util.find_spec("mcp") is not None
+
+
+def _run_official_stdio(cfg: AtlasConfig) -> None:
+    """Run the read-only server through the current official Python SDK.
+
+    Imports stay lazy so the standard-library compatibility transport remains
+    usable on a clean Windows installation.  This implementation follows the
+    v2 low-level SDK API: constructor-registered handlers and ``stdio_server``.
+    """
+
+    from mcp.server import Server
+    from mcp.server.stdio import stdio_server
+    from mcp.types import (
+        CallToolRequestParams,
+        CallToolResult,
+        ListToolsResult,
+        PaginatedRequestParams,
+        TextContent,
+        Tool,
+    )
+
+    service = McpService(cfg)
+    sdk_tools = [
+        Tool(
+            name=tool["name"],
+            description=tool["description"],
+            input_schema=tool["inputSchema"],
+        )
+        for tool in TOOLS
+    ]
+
+    async def list_tools(_ctx: Any, _params: PaginatedRequestParams | None) -> ListToolsResult:
+        return ListToolsResult(tools=sdk_tools)
+
+    async def call_tool(_ctx: Any, params: CallToolRequestParams) -> CallToolResult:
+        try:
+            data = service.call(params.name, params.arguments or {})
+        except Exception as exc:
+            data = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+        return CallToolResult(
+            content=[TextContent(type="text", text=json.dumps(data, ensure_ascii=False))],
+            structured_content=data,
+            is_error=data.get("status") in {"error", "denied", "not_found"},
+        )
+
+    server = Server("shutu-atlas", on_list_tools=list_tools, on_call_tool=call_tool)
+
+    async def serve() -> None:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(
+                read_stream,
+                write_stream,
+                server.create_initialization_options(),
+            )
+
+    asyncio.run(serve())
+
+
+def _run_compat_stdio(cfg: AtlasConfig) -> None:
+    """Run the dependency-free JSON-RPC compatibility transport."""
+
     service = McpService(cfg)
     for line in sys.stdin:
         line = line.strip()
@@ -104,4 +174,13 @@ def run_stdio(cfg: AtlasConfig) -> None:
                 sys.stdout.flush()
         except json.JSONDecodeError as exc:
             print(f"invalid JSON-RPC input: {exc}", file=sys.stderr)
+
+
+def run_stdio(cfg: AtlasConfig) -> None:
+    """Prefer the official SDK and retain a truthful dependency-free fallback."""
+
+    if official_sdk_available():
+        _run_official_stdio(cfg)
+    else:
+        _run_compat_stdio(cfg)
 

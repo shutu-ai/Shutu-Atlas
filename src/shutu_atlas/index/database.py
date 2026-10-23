@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 import shutil
@@ -39,7 +40,9 @@ CREATE TABLE IF NOT EXISTS symbols (
 );
 CREATE TABLE IF NOT EXISTS capabilities (
   capability_id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
-  name TEXT NOT NULL, label TEXT NOT NULL, status TEXT NOT NULL, updated_at TEXT NOT NULL,
+  name TEXT NOT NULL, label TEXT NOT NULL, status TEXT NOT NULL,
+  manual_status TEXT, manual_label TEXT, manual_note TEXT, reviewed_at TEXT,
+  updated_at TEXT NOT NULL,
   UNIQUE(project_id, name)
 );
 CREATE TABLE IF NOT EXISTS capability_evidence (
@@ -62,7 +65,7 @@ CREATE TABLE IF NOT EXISTS ui_source_links (
 CREATE TABLE IF NOT EXISTS index_runs (
   run_id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, finished_at TEXT,
   mode TEXT NOT NULL, projects_seen INTEGER NOT NULL DEFAULT 0, files_indexed INTEGER NOT NULL DEFAULT 0,
-  errors INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL
+  errors INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, owner_pid INTEGER
 );
 CREATE TABLE IF NOT EXISTS index_errors (
   error_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL REFERENCES index_runs(run_id) ON DELETE CASCADE,
@@ -96,6 +99,20 @@ def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _process_alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def connect(db_path: Path, readonly: bool = False) -> sqlite3.Connection:
     if readonly:
         uri = f"file:{db_path.as_posix()}?mode=ro"
@@ -112,6 +129,19 @@ def init_db(cfg: AtlasConfig) -> None:
     cfg.ensure_local_dirs()
     with connect(cfg.db_path) as conn:
         conn.executescript(SCHEMA)
+        run_columns = {row[1] for row in conn.execute("PRAGMA table_info(index_runs)")}
+        if "owner_pid" not in run_columns:
+            conn.execute("ALTER TABLE index_runs ADD COLUMN owner_pid INTEGER")
+        capability_columns = {row[1] for row in conn.execute("PRAGMA table_info(capabilities)")}
+        for column, definition in (
+            ("manual_status", "TEXT"),
+            ("manual_label", "TEXT"),
+            ("manual_note", "TEXT"),
+            ("reviewed_at", "TEXT"),
+        ):
+            if column not in capability_columns:
+                conn.execute(f"ALTER TABLE capabilities ADD COLUMN {column} {definition}")
+        conn.execute("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', '3')")
         conn.commit()
 
 
@@ -194,6 +224,23 @@ class IndexStore:
     def __init__(self, cfg: AtlasConfig):
         self.cfg = cfg
         init_db(cfg)
+        self._recover_stale_runs()
+
+    def _recover_stale_runs(self) -> None:
+        """Close abandoned runs after a killed process without touching live work."""
+
+        with connect(self.cfg.db_path) as conn:
+            rows = conn.execute("SELECT run_id,owner_pid FROM index_runs WHERE status='running'").fetchall()
+            changed = False
+            for row in rows:
+                if not _process_alive(row["owner_pid"]):
+                    conn.execute(
+                        "UPDATE index_runs SET finished_at=?,status='interrupted' WHERE run_id=?",
+                        (utc_now(), row["run_id"]),
+                    )
+                    changed = True
+            if changed:
+                conn.commit()
 
     def _upsert_project(self, conn: sqlite3.Connection, project: ProjectRecord) -> None:
         conn.execute(
@@ -205,13 +252,14 @@ class IndexStore:
 
     def index(self, projects: Iterable[ProjectRecord], changed_only: bool = False) -> dict[str, Any]:
         self.cfg.ensure_local_dirs()
+        project_list = list(projects)
         with connect(self.cfg.db_path) as conn:
-            cur = conn.execute("INSERT INTO index_runs(started_at,mode,status) VALUES(?,?,?)", (utc_now(), "changed-only" if changed_only else "full", "running"))
+            cur = conn.execute("INSERT INTO index_runs(started_at,mode,status,owner_pid) VALUES(?,?,?,?)", (utc_now(), "changed-only" if changed_only else "full", "running", os.getpid()))
             run_id = cur.lastrowid
             conn.commit()
             counts = {"projects_seen": 0, "files_indexed": 0, "errors": 0}
             try:
-                for project in projects:
+                for project in project_list:
                     if project.excluded:
                         continue
                     counts["projects_seen"] += 1
@@ -223,6 +271,32 @@ class IndexStore:
                         counts["errors"] += 1
                         conn.execute("INSERT INTO index_errors(run_id,project_id,relative_path,error_type,message,created_at) VALUES(?,?,?,?,?,?)", (run_id, project.project_id, None, type(exc).__name__, str(exc)[:1000], utc_now()))
                         conn.commit()
+                    conn.execute(
+                        "UPDATE index_runs SET projects_seen=?,files_indexed=?,errors=? WHERE run_id=?",
+                        (counts["projects_seen"], counts["files_indexed"], counts["errors"], run_id),
+                    )
+                    conn.commit()
+                # A root-wide refresh is authoritative.  A targeted include
+                # refresh must preserve projects outside the requested set.
+                if not self.cfg.include_projects:
+                    ids = [project.project_id for project in project_list if not project.excluded]
+                    if ids:
+                        placeholders = ",".join("?" for _ in ids)
+                        orphan_rows = conn.execute(
+                            f"SELECT project_id FROM projects WHERE project_id NOT IN ({placeholders})",
+                            ids,
+                        ).fetchall()
+                        for orphan in orphan_rows:
+                            conn.execute("DELETE FROM fts_content WHERE project_id=?", (orphan["project_id"],))
+                        conn.execute(f"DELETE FROM projects WHERE project_id NOT IN ({placeholders})", ids)
+                    else:
+                        conn.execute("DELETE FROM fts_content")
+                        conn.execute("DELETE FROM projects")
+                    # FTS5 has no foreign-key cascade; remove rows left by
+                    # older databases and by projects deleted before this
+                    # reconciliation step existed.
+                    conn.execute("DELETE FROM fts_content WHERE project_id NOT IN (SELECT project_id FROM projects)")
+                    conn.commit()
             except KeyboardInterrupt:
                 conn.rollback()
                 conn.execute("UPDATE index_runs SET finished_at=?,projects_seen=?,files_indexed=?,errors=?,status=? WHERE run_id=?", (utc_now(), counts["projects_seen"], counts["files_indexed"], counts["errors"], "interrupted", run_id))
@@ -255,7 +329,14 @@ class IndexStore:
             conn.executemany("INSERT INTO symbols(file_id,name,kind,start_line,end_line,signature,source) VALUES(?,?,?,?,?,?,?)", [(file_id, s["name"], s["kind"], s["start_line"], s["end_line"], s["signature"], s["source"]) for s in extract_symbols(text, language)])
             conn.execute("DELETE FROM capability_evidence WHERE file_id=?", (file_id,))
             for cap in detect_capabilities(text, language):
-                conn.execute("INSERT INTO capabilities(project_id,name,label,status,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(project_id,name) DO UPDATE SET label=excluded.label,status=excluded.status,updated_at=excluded.updated_at", (project.project_id, cap["name"], cap["label"], cap["status"], now))
+                conn.execute(
+                    "INSERT INTO capabilities(project_id,name,label,status,updated_at) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(project_id,name) DO UPDATE SET "
+                    "label=CASE WHEN capabilities.manual_label IS NULL THEN excluded.label ELSE capabilities.manual_label END, "
+                    "status=CASE WHEN capabilities.manual_status IS NULL THEN excluded.status ELSE capabilities.manual_status END, "
+                    "updated_at=excluded.updated_at",
+                    (project.project_id, cap["name"], cap["label"], cap["status"], now),
+                )
                 cap_id = conn.execute("SELECT capability_id FROM capabilities WHERE project_id=? AND name=?", (project.project_id, cap["name"])).fetchone()[0]
                 conn.execute("INSERT INTO capability_evidence(capability_id,file_id,start_line,end_line,snippet,reason) VALUES(?,?,?,?,?,?)", (cap_id, file_id, cap["line"], cap["line"], cap["snippet"], cap["reason"]))
             conn.execute("DELETE FROM ui_source_links WHERE file_id=?", (file_id,))
@@ -269,7 +350,7 @@ class IndexStore:
             if relative not in seen:
                 conn.execute("DELETE FROM files WHERE file_id=?", (row["file_id"],))
                 conn.execute("DELETE FROM fts_content WHERE file_id=?", (row["file_id"],))
-        conn.execute("DELETE FROM capabilities WHERE project_id=? AND capability_id NOT IN (SELECT DISTINCT c.capability_id FROM capabilities c JOIN capability_evidence e ON e.capability_id=c.capability_id WHERE c.project_id=?)", (project.project_id, project.project_id))
+                conn.execute("DELETE FROM capabilities WHERE project_id=? AND capability_id NOT IN (SELECT DISTINCT c.capability_id FROM capabilities c JOIN capability_evidence e ON e.capability_id=c.capability_id WHERE c.project_id=?)", (project.project_id, project.project_id))
         conn.execute("UPDATE projects SET file_count=(SELECT count(*) FROM files WHERE project_id=?) WHERE project_id=?", (project.project_id, project.project_id))
         return changed
 
@@ -278,6 +359,16 @@ class IndexStore:
         with connect(self.cfg.db_path, readonly=True) as conn:
             rows = conn.execute("SELECT * FROM projects WHERE excluded=0 AND (? IS NULL OR name LIKE ? OR path LIKE ?) ORDER BY name LIMIT ?", (filter_text, f"%{filter_text}%" if filter_text else None, f"%{filter_text}%" if filter_text else None, limit)).fetchall()
         return [self._project_dict(row) for row in rows]
+
+    def get_project(self, project_id: str) -> dict[str, Any] | None:
+        """Return one indexed project for isolated symbol-provider work."""
+
+        with connect(self.cfg.db_path, readonly=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM projects WHERE project_id=? AND excluded=0",
+                (project_id,),
+            ).fetchone()
+        return self._project_dict(row) if row else None
 
     @staticmethod
     def _project_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -294,13 +385,13 @@ class IndexStore:
         fts_query = " OR ".join('"' + t.replace('"', ' ') + '"' for t in terms)
         results: list[dict[str, Any]] = []
         with connect(self.cfg.db_path, readonly=True) as conn:
-            sql = "SELECT f.project_id,f.file_id,f.relative_path,f.language,s.highlight FROM fts_content f JOIN (SELECT project_id,file_id,relative_path,language,content,highlight(fts_content,4,'[HIGHLIGHT]','[/HIGHLIGHT]') AS highlight FROM fts_content WHERE fts_content MATCH ?) s ON s.file_id=f.file_id WHERE (? IS NULL OR f.project_id=?) AND (? IS NULL OR f.language=?) LIMIT ?"
+            sql = "SELECT f.project_id,f.file_id,f.relative_path,f.language,p.git_head,p.branch,p.dirty,s.highlight FROM fts_content f JOIN (SELECT project_id,file_id,relative_path,language,content,highlight(fts_content,4,'[HIGHLIGHT]','[/HIGHLIGHT]') AS highlight FROM fts_content WHERE fts_content MATCH ?) s ON s.file_id=f.file_id JOIN projects p ON p.project_id=f.project_id WHERE (? IS NULL OR f.project_id=?) AND (? IS NULL OR f.language=?) LIMIT ?"
             try:
                 rows = conn.execute(sql, (fts_query, project_id, project_id, language, language, limit)).fetchall()
             except sqlite3.OperationalError:
                 rows = []
             for row in rows:
-                results.append({"project_id": row["project_id"], "file_id": row["file_id"], "relative_path": row["relative_path"], "language": row["language"], "snippet": row["highlight"][: self.cfg.limits.max_chars], "match_reason": "fts", "evidence": "SQLite FTS5 BM25 candidate"})
+                results.append({"project_id": row["project_id"], "file_id": row["file_id"], "relative_path": row["relative_path"], "language": row["language"], "git_head": row["git_head"], "branch": row["branch"], "dirty": None if row["dirty"] is None else bool(row["dirty"]), "snippet": row["highlight"][: self.cfg.limits.max_chars], "match_reason": "fts", "evidence": "SQLite FTS5 BM25 candidate"})
         for item in self._rg_search(query, limit, project_id, language):
             if not any(r["project_id"] == item["project_id"] and r["relative_path"] == item["relative_path"] and r.get("line") == item.get("line") for r in results):
                 results.append(item)
@@ -312,7 +403,7 @@ class IndexStore:
         if not shutil.which("rg"):
             return []
         with connect(self.cfg.db_path, readonly=True) as conn:
-            rows = conn.execute("SELECT project_id,path FROM projects WHERE excluded=0 AND (? IS NULL OR project_id=?)", (project_id, project_id)).fetchall()
+            rows = conn.execute("SELECT project_id,path,git_head,branch,dirty FROM projects WHERE excluded=0 AND (? IS NULL OR project_id=?)", (project_id, project_id)).fetchall()
         results: list[dict[str, Any]] = []
         for row in rows:
             try:
@@ -333,7 +424,7 @@ class IndexStore:
                     continue
                 with connect(self.cfg.db_path, readonly=True) as local:
                     file_row = local.execute("SELECT file_id FROM files WHERE project_id=? AND relative_path=?", (row["project_id"], rel)).fetchone()
-                results.append({"project_id": row["project_id"], "file_id": file_row[0] if file_row else None, "relative_path": rel, "language": _language(rel), "line": int(line), "snippet": text[: self.cfg.limits.max_chars], "match_reason": "regex", "evidence": "ripgrep fixed-string match"})
+                results.append({"project_id": row["project_id"], "file_id": file_row[0] if file_row else None, "relative_path": rel, "language": _language(rel), "git_head": row["git_head"], "branch": row["branch"], "dirty": None if row["dirty"] is None else bool(row["dirty"]), "line": int(line), "snippet": text[: self.cfg.limits.max_chars], "match_reason": "regex", "evidence": "ripgrep fixed-string match"})
                 if len(results) >= limit:
                     return results
         return results
@@ -342,7 +433,7 @@ class IndexStore:
         limit = min(max(1, limit), self.cfg.limits.max_results)
         terms = _query_terms(query)
         with connect(self.cfg.db_path, readonly=True) as conn:
-            term_conditions = ["(c.label LIKE ? OR c.name LIKE ? OR e.snippet LIKE ?)"] * len(terms)
+            term_conditions = ["(COALESCE(c.manual_label,c.label) LIKE ? OR c.name LIKE ? OR e.snippet LIKE ?)"] * len(terms)
             conditions = ["(" + " OR ".join(term_conditions) + ")"]
             params: list[Any] = []
             for term in terms:
@@ -350,28 +441,70 @@ class IndexStore:
             if project_filter:
                 conditions.append("(p.name LIKE ? OR p.project_id=?)")
                 params.extend([f"%{project_filter}%", project_filter])
-            rows = conn.execute(f"SELECT c.name,c.label,c.status,p.project_id,p.name AS project_name,p.path,e.file_id,f.language,f.relative_path,e.start_line,e.end_line,e.snippet,e.reason FROM capabilities c JOIN projects p ON p.project_id=c.project_id JOIN capability_evidence e ON e.capability_id=c.capability_id JOIN files f ON f.file_id=e.file_id WHERE {' AND '.join(conditions)} ORDER BY CASE c.status WHEN 'verified' THEN 0 WHEN 'inferred' THEN 1 ELSE 2 END, CASE WHEN f.language IN ('Markdown','JSON','TOML','Text') THEN 1 ELSE 0 END, p.name LIMIT ?", (*params, limit)).fetchall()
-        return {"status": "ok", "query": query, "terms": terms, "results": [dict(row) for row in rows], "warnings": []}
+            rows = conn.execute(f"SELECT c.name,COALESCE(c.manual_label,c.label) AS label,COALESCE(c.manual_status,c.status) AS status,c.manual_note,c.reviewed_at,p.project_id,p.name AS project_name,p.path,p.git_head,p.branch,p.dirty,e.file_id,f.language,f.relative_path,e.start_line,e.end_line,e.snippet,e.reason FROM capabilities c JOIN projects p ON p.project_id=c.project_id JOIN capability_evidence e ON e.capability_id=c.capability_id JOIN files f ON f.file_id=e.file_id WHERE {' AND '.join(conditions)} ORDER BY CASE COALESCE(c.manual_status,c.status) WHEN 'verified' THEN 0 WHEN 'inferred' THEN 1 ELSE 2 END, CASE WHEN f.language IN ('Markdown','JSON','TOML','Text') THEN 1 ELSE 0 END, p.name LIMIT ?", (*params, limit)).fetchall()
+        results = [dict(row) for row in rows]
+        for item in results:
+            item["dirty"] = None if item["dirty"] is None else bool(item["dirty"])
+        return {"status": "ok", "query": query, "terms": terms, "results": results, "warnings": []}
+
+    def confirm_capability(
+        self,
+        project_id: str,
+        name: str,
+        status: str,
+        label: str | None = None,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Maintain a Hub-local human review without changing source files."""
+
+        if status not in {"verified", "inferred", "unverified"}:
+            return {"status": "invalid_request", "warnings": ["status must be verified, inferred, or unverified"]}
+        with connect(self.cfg.db_path) as conn:
+            row = conn.execute(
+                "SELECT capability_id,label FROM capabilities WHERE project_id=? AND name=?",
+                (project_id, name),
+            ).fetchone()
+            if not row:
+                return {"status": "not_found", "warnings": ["capability is not indexed for this project"]}
+            reviewed_at = utc_now()
+            conn.execute(
+                "UPDATE capabilities SET manual_status=?,manual_label=?,manual_note=?,reviewed_at=?,updated_at=? WHERE capability_id=?",
+                (status, label.strip() if label and label.strip() else None, note.strip() if note and note.strip() else None, reviewed_at, reviewed_at, row["capability_id"]),
+            )
+            conn.commit()
+        return {
+            "status": "ok",
+            "project_id": project_id,
+            "name": name,
+            "effective_status": status,
+            "label": label.strip() if label and label.strip() else row["label"],
+            "reviewed_at": reviewed_at,
+            "warnings": ["Hub-local review metadata only; source project was not modified"],
+        }
 
     def find_symbols(self, name: str, project_id: str | None = None, kind: str | None = None, limit: int = 20) -> dict[str, Any]:
         limit = min(max(1, limit), self.cfg.limits.max_results)
         with connect(self.cfg.db_path, readonly=True) as conn:
-            rows = conn.execute("SELECT s.name,s.kind,s.start_line,s.end_line,s.signature,s.source,f.file_id,f.relative_path,p.project_id,p.name AS project_name,p.path FROM symbols s JOIN files f ON f.file_id=s.file_id JOIN projects p ON p.project_id=f.project_id WHERE lower(s.name)=lower(?) AND (? IS NULL OR p.project_id=?) AND (? IS NULL OR s.kind=?) ORDER BY p.name,f.relative_path,s.start_line LIMIT ?", (name, project_id, project_id, kind, kind, limit)).fetchall()
-        return {"status": "degraded", "provider": "fallback-static", "serena": "unavailable", "results": [dict(row) for row in rows], "warnings": ["Serena is not installed; static symbols are used"]}
+            rows = conn.execute("SELECT s.name,s.kind,s.start_line,s.end_line,s.signature,s.source,f.file_id,f.relative_path,p.project_id,p.name AS project_name,p.path,p.git_head,p.branch,p.dirty FROM symbols s JOIN files f ON f.file_id=s.file_id JOIN projects p ON p.project_id=f.project_id WHERE lower(s.name)=lower(?) AND (? IS NULL OR p.project_id=?) AND (? IS NULL OR s.kind=?) ORDER BY p.name,f.relative_path,s.start_line LIMIT ?", (name, project_id, project_id, kind, kind, limit)).fetchall()
+        results = [dict(row) for row in rows]
+        for item in results:
+            item["dirty"] = None if item["dirty"] is None else bool(item["dirty"])
+        return {"status": "degraded", "provider": "fallback-static", "serena": "unavailable", "results": results, "warnings": ["Serena is not installed; static symbols are used"]}
 
     def find_ui(self, query: str, limit: int = 12, project_id: str | None = None) -> dict[str, Any]:
         limit = min(max(1, limit), self.cfg.limits.max_results)
         terms = _query_terms(query)
-        conditions = ["u.search_text LIKE ?"]
-        params: list[Any] = [f"%{terms[0]}%"]
+        conditions = ["(" + " OR ".join("u.search_text LIKE ?" for _ in terms) + ")"]
+        params: list[Any] = [f"%{term}%" for term in terms]
         if project_id:
             conditions.append("u.project_id=?")
             params.append(project_id)
         with connect(self.cfg.db_path, readonly=True) as conn:
-            rows = conn.execute(f"SELECT u.*,p.name AS project_name,p.path,f.file_id,f.relative_path FROM ui_assets u JOIN projects p ON p.project_id=u.project_id LEFT JOIN files f ON f.file_id=u.file_id WHERE {' AND '.join(conditions)} ORDER BY u.name LIMIT ?", (*params, limit)).fetchall()
+            rows = conn.execute(f"SELECT u.*,p.name AS project_name,p.path,p.git_head,p.branch,p.dirty,f.file_id,f.relative_path FROM ui_assets u JOIN projects p ON p.project_id=u.project_id LEFT JOIN files f ON f.file_id=u.file_id WHERE {' AND '.join(conditions)} ORDER BY u.name LIMIT ?", (*params, limit)).fetchall()
         results = [dict(row) for row in rows]
         for item in results:
             item["features"] = json.loads(item.pop("features_json"))
+            item["dirty"] = None if item["dirty"] is None else bool(item["dirty"])
         return {"status": "ok", "query": query, "terms": terms, "results": results, "warnings": ["No real screenshot is claimed unless screenshot_status=available"]}
 
     def get_source(self, project_id: str, file_id: int, start_line: int = 1, end_line: int | None = None) -> dict[str, Any]:
@@ -391,11 +524,12 @@ class IndexStore:
 
     def ui_detail(self, asset_id: str) -> dict[str, Any]:
         with connect(self.cfg.db_path, readonly=True) as conn:
-            row = conn.execute("SELECT u.*,p.name AS project_name,p.project_id,p.path,f.file_id,f.relative_path,l.start_line,l.end_line FROM ui_assets u JOIN projects p ON p.project_id=u.project_id LEFT JOIN files f ON f.file_id=u.file_id LEFT JOIN ui_source_links l ON l.asset_id=u.asset_id WHERE u.asset_id=?", (asset_id,)).fetchone()
+            row = conn.execute("SELECT u.*,p.name AS project_name,p.project_id,p.path,p.git_head,p.branch,p.dirty,f.file_id,f.relative_path,l.start_line,l.end_line FROM ui_assets u JOIN projects p ON p.project_id=u.project_id LEFT JOIN files f ON f.file_id=u.file_id LEFT JOIN ui_source_links l ON l.asset_id=u.asset_id WHERE u.asset_id=?", (asset_id,)).fetchone()
         if not row:
             return {"status": "not_found", "warnings": []}
         result = dict(row)
         result["features"] = json.loads(result.pop("features_json"))
+        result["dirty"] = None if result["dirty"] is None else bool(result["dirty"])
         result["reference_prompt"] = f"参考 UI 资产 {asset_id}：项目 {result['project_name']}，源码 {result['relative_path']} 行 {result['start_line']}-{result['end_line']}。只借鉴布局/视觉线索，先核验源码和许可证。"
         return {"status": "ok", "asset": result, "warnings": []}
 
