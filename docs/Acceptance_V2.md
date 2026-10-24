@@ -3,16 +3,13 @@
 Date: 2026-10-24
 
 Branch: `main`
-Baseline: `origin/main` was fetched successfully at the start. A final fetch
-attempt was also made before handoff but was blocked by the same GitHub network
-failure; the available remote-tracking HEAD remained
-`cc3ab2633d49bdc190eaf1a50f2517d4d0e26480`.
+Baseline: `origin/main` was fetched successfully at the start. The final
+release commit was pushed and verified on `origin/main`.
 
 Final disposition: **V2 READY — Codex / Local Reference Library** (local
 Codex gates complete).
 
-GitHub publication: **BLOCKED_ENV** — the local release commit exists, but
-`git push origin main` could not connect to `github.com:443`.
+GitHub publication: **PASS** — `origin/main` resolves to the release commit.
 OpenCode: **UNVERIFIED** (separate client scope; not a Codex release gate).
 
 This closure covers M0–M4 only. Source projects under `D:\dev-projects` were
@@ -33,7 +30,7 @@ screenshots, test-work directories, and Codex event logs remain under
 | A07 read-only daily MCP surface and reproducible config | `PASS` | `docs/MCP_Skill_Integration.md:68-82` contains the mergeable Codex TOML entry using the integration-venv Python and `PYTHONPATH=src`. The actual one-shot Codex override did not edit user configuration. The MCP server exposes 9 query/health tools only; no refresh, shell, Git-write, source-write, or Gallery-write tool is present. |
 | A08 real Codex Skill/MCP reuse E2E | `PASS` | `.local/closure-m3-codex-e2e.json` and `.local/codex-e2e-20261024/REUSE_REPORT.md` record Codex CLI 0.163.0 loading `skills/local-project-reuse/SKILL.md`, calling `atlas_health`, capability/search/symbol/source tools, and using verified Carbon Lens implementation/test evidence. It chose `adapt`, created an independent stdlib JSON checkpoint component at `checkpoint.py:14-191` with tests at `tests/test_checkpoint.py:24-64`, and the target command passed `4 passed in 0.08s`. The inferred capability at `scripts/live_acceptance.py:251` was not treated as proof; verified symbol/test evidence was used instead. |
 | A09 security, build, and regression checks | `PASS` | Base `python -m pytest -q`: `20 passed, 5 skipped in 60.43s`; integration-venv pytest: `22 passed, 3 skipped in 69.83s`; `python -m compileall -q src tests`, `node --check web/app.js`, and `git diff --check` all passed. Base skips are the explicit browser opt-in, unavailable base MCP/Serena packages, Windows symlink limitation, and the corresponding MCP Skill guard; integration skips are browser opt-in, symlink limitation, and the Serena test's PATH guard. The actual warmed official MCP/Serena proof is the M2 gate above. |
-| A10 documentation and Git handoff | `BLOCKED_ENV` | This report, `docs/Operations_Windows.md`, and `docs/MCP_Skill_Integration.md` contain reproducible commands, version pins, exact paths, line-level evidence, and the OpenCode `UNVERIFIED` boundary. The implementation commit was created locally; repeated `git push origin main` attempts failed before contacting GitHub with `Failed to connect to github.com:443`. No proxy/VPN/system configuration was changed. `.local` evidence and the pre-existing task file are intentionally untracked. |
+| A10 documentation and Git handoff | `PASS` | This report, `docs/Operations_Windows.md`, and `docs/MCP_Skill_Integration.md` contain reproducible commands, version pins, exact paths, line-level evidence, and the OpenCode `UNVERIFIED` boundary. Release commit `eed9426be8d3fadbd14ff4f724d2662422fe3c42` is present on `origin/main`; tracked changes are clean. `.local` evidence and the pre-existing task file are intentionally untracked. |
 
 ## M1 index evidence
 
@@ -98,5 +95,4 @@ unverified license status, MCP calls, event log, target Git state, and tests.
 `V2 READY — Codex / Local Reference Library` applies to the Codex CLI + local
 Atlas MCP/Serena environment verified above. It does not claim OpenCode
 support. OpenCode remains `UNVERIFIED` because no authenticated client session
-was completed and no user configuration workaround was made. GitHub publication
-remains pending until a network-enabled shell can reach `github.com:443`.
+was completed and no user configuration workaround was made.
