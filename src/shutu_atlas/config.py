@@ -24,6 +24,7 @@ class Limits:
     max_chars: int = 8_000
     command_timeout_seconds: float = 8.0
     changed_only_hash_mode: str = "stat"
+    freshness_stale_after_hours: float = 26.0
 
 
 @dataclass(slots=True)

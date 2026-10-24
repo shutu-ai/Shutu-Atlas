@@ -20,4 +20,6 @@ max_snippet_lines = 12
 max_chars = 8000
 command_timeout_seconds = 8.0
 changed_only_hash_mode = "stat"
+# A root index older than this is reported as stale by atlas status/atlas_health.
+freshness_stale_after_hours = 26.0
 

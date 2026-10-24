@@ -38,4 +38,8 @@ def test_mcp_read_only_tools(test_config):
     assert not any("write" in name or "exec" in name for name in names)
     call = handle_message(service, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "atlas_list_projects", "arguments": {"limit": 2}}})
     assert call["result"]["structuredContent"]["results"]
+    health_call = handle_message(service, {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "atlas_health", "arguments": {}}})
+    health = health_call["result"]["structuredContent"]
+    assert health["last_successful_index_at"]
+    assert health["freshness"]["coverage_scope"] == "root"
 

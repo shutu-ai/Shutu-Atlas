@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -80,7 +82,8 @@ CREATE TABLE IF NOT EXISTS index_runs (
   scanned_bytes INTEGER NOT NULL DEFAULT 0, skipped_files INTEGER NOT NULL DEFAULT 0,
   changed_files INTEGER NOT NULL DEFAULT 0, unchanged_files INTEGER NOT NULL DEFAULT 0,
   stage_timings_json TEXT NOT NULL DEFAULT '{}', stage_counts_json TEXT NOT NULL DEFAULT '{}',
-  hash_mode TEXT NOT NULL DEFAULT 'always', resume_from_run INTEGER
+  hash_mode TEXT NOT NULL DEFAULT 'always', resume_from_run INTEGER,
+  coverage_scope TEXT NOT NULL DEFAULT 'unknown'
 );
 CREATE TABLE IF NOT EXISTS index_errors (
   error_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL REFERENCES index_runs(run_id) ON DELETE CASCADE,
@@ -183,6 +186,62 @@ class ProjectIndexResult:
         }
 
 
+class IndexWriterBusy(RuntimeError):
+    """Raised when another Atlas entry point owns the project-local writer lock."""
+
+
+@contextmanager
+def index_writer_lock(db_path: Path):
+    """Coordinate every index writer without deleting stale lock files.
+
+    The OS releases the byte/file lock when the owning process exits.  The
+    marker file is deliberately retained under ``.local`` so an interrupted
+    process never requires a risky lock-file deletion before recovery.
+    """
+
+    lock_path = Path(db_path).with_name(Path(db_path).name + ".writer.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    acquired = False
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise IndexWriterBusy("another Atlas index writer owns the project-local lock") from exc
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise IndexWriterBusy("another Atlas index writer owns the project-local lock") from exc
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+
 def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -253,6 +312,7 @@ def init_db(cfg: AtlasConfig) -> None:
             ("stage_counts_json", "TEXT NOT NULL DEFAULT '{}'"),
             ("hash_mode", "TEXT NOT NULL DEFAULT 'always'"),
             ("resume_from_run", "INTEGER"),
+            ("coverage_scope", "TEXT NOT NULL DEFAULT 'unknown'"),
         ):
             if column not in run_columns:
                 conn.execute(f"ALTER TABLE index_runs ADD COLUMN {column} {definition}")
@@ -473,6 +533,58 @@ class IndexStore:
         retry_projects: Iterable[str] | None = None,
         discovery_report: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Run one index under the shared project-local writer lock.
+
+        Task Scheduler's ``IgnoreNew`` setting only coordinates instances of
+        the scheduled task.  This guard also coordinates manual CLI and other
+        Atlas entry points before they can write SQLite or FTS content.
+        """
+
+        try:
+            with index_writer_lock(self.cfg.db_path):
+                return self._index_unlocked(
+                    projects,
+                    changed_only=changed_only,
+                    force_hash=force_hash,
+                    resume=resume,
+                    retry_projects=retry_projects,
+                    discovery_report=discovery_report,
+                )
+        except IndexWriterBusy:
+            hash_mode = "force-hash" if force_hash and changed_only else ("stat" if changed_only else "always")
+            return {
+                "run_id": None,
+                "mode": "changed-only" if changed_only else "full",
+                "hash_mode": hash_mode,
+                "resume_from_run": None,
+                "coverage_scope": "skipped",
+                "projects_total": 0,
+                "projects_seen": 0,
+                "projects_completed": 0,
+                "files_indexed": 0,
+                "files_scanned": 0,
+                "scanned_bytes": 0,
+                "skipped_files": 0,
+                "changed_files": 0,
+                "unchanged_files": 0,
+                "errors": 0,
+                "status": "skipped_running",
+                "skip_reason": "another Atlas index writer owns the project-local lock",
+                "elapsed_ms": 0.0,
+                "stage_timings_ms": {},
+                "stage_counts": {},
+                "projects": [],
+            }
+
+    def _index_unlocked(
+        self,
+        projects: Iterable[ProjectRecord],
+        changed_only: bool = False,
+        force_hash: bool = False,
+        resume: bool = False,
+        retry_projects: Iterable[str] | None = None,
+        discovery_report: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         self.cfg.ensure_local_dirs()
         started = time.perf_counter_ns()
         project_list = list(projects)
@@ -486,6 +598,7 @@ class IndexStore:
         force_hash = bool(force_hash and changed_only)
         hash_mode = "force-hash" if force_hash else ("stat" if changed_only else "always")
         mode = "changed-only" if changed_only else "full"
+        coverage_scope = "targeted-retry" if retry_only else ("configured-projects" if self.cfg.include_projects else "root")
         run_metrics = StageMetrics()
         project_results: list[ProjectIndexResult] = []
 
@@ -510,12 +623,12 @@ class IndexStore:
                         }
             cur = conn.execute(
                 """INSERT INTO index_runs(
-                    started_at,mode,status,owner_pid,projects_total,hash_mode,resume_from_run,
+                    started_at,mode,status,owner_pid,projects_total,hash_mode,resume_from_run,coverage_scope,
                     stage_timings_json,stage_counts_json
-                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 (
                     utc_now(), mode, "running", os.getpid(), len(target_projects), hash_mode,
-                    resume_from_run, "{}", "{}",
+                    resume_from_run, coverage_scope, "{}", "{}",
                 ),
             )
             run_id = int(cur.lastrowid)
@@ -657,6 +770,7 @@ class IndexStore:
                 "mode": mode,
                 "hash_mode": hash_mode,
                 "resume_from_run": resume_from_run,
+                "coverage_scope": coverage_scope,
                 "projects_total": len(target_projects),
                 **counts,
                 "status": final_status,
@@ -1411,6 +1525,26 @@ class IndexStore:
         with connect(self.cfg.db_path, readonly=True) as conn:
             counts = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in ("projects", "files", "symbols", "capabilities", "ui_assets", "index_runs", "index_errors")}
             last = conn.execute("SELECT * FROM index_runs ORDER BY run_id DESC LIMIT 1").fetchone()
+            last_successful = conn.execute(
+                """SELECT * FROM index_runs
+                   WHERE status='ok' AND coverage_scope='root' AND projects_total > 0
+                   ORDER BY finished_at DESC, run_id DESC LIMIT 1""",
+            ).fetchone()
+            last_failure = conn.execute(
+                """SELECT * FROM index_runs
+                   WHERE status IN ('error', 'partial', 'interrupted') OR errors > 0
+                   ORDER BY run_id DESC LIMIT 1""",
+            ).fetchone()
+            failure_errors = []
+            if last_failure:
+                failure_errors = [
+                    dict(row)
+                    for row in conn.execute(
+                        """SELECT error_type,message,project_id,relative_path
+                           FROM index_errors WHERE run_id=? ORDER BY error_id LIMIT 3""",
+                        (last_failure["run_id"],),
+                    ).fetchall()
+                ]
             progress = []
             if last:
                 progress = [dict(row) for row in conn.execute("SELECT * FROM index_project_runs WHERE run_id=? ORDER BY ordinal", (last["run_id"],)).fetchall()]
@@ -1429,11 +1563,59 @@ class IndexStore:
                     item[key.removesuffix("_json")] = json.loads(raw or "{}")
                 except (TypeError, json.JSONDecodeError):
                     item[key.removesuffix("_json")] = {}
+        last_successful_dict = dict(last_successful) if last_successful else None
+        last_attempt_at = None
+        last_attempt_status = None
+        current_state = "unknown"
+        if last_dict:
+            last_attempt_at = last_dict.get("finished_at") or last_dict.get("started_at")
+            last_attempt_status = last_dict.get("status")
+            current_state = last_attempt_status or "unknown"
+
+        last_successful_at = last_successful_dict.get("finished_at") if last_successful_dict else None
+        age_seconds: float | None = None
+        freshness_level = "unknown"
+        threshold_seconds = max(1.0, float(self.cfg.limits.freshness_stale_after_hours) * 3600.0)
+        if last_successful_at:
+            try:
+                completed_at = datetime.fromisoformat(last_successful_at.replace("Z", "+00:00"))
+                age_seconds = max(0.0, (datetime.now(timezone.utc) - completed_at).total_seconds())
+                freshness_level = "fresh" if age_seconds <= threshold_seconds else "stale"
+            except (TypeError, ValueError, OverflowError):
+                freshness_level = "unknown"
+        else:
+            freshness_level = "unknown"
+
+        last_failure_summary = None
+        if last_failure:
+            last_failure_summary = {
+                "run_id": last_failure["run_id"],
+                "status": last_failure["status"],
+                "finished_at": last_failure["finished_at"],
+                "errors": last_failure["errors"],
+                "coverage_scope": last_failure["coverage_scope"],
+                "errors_detail": failure_errors,
+            }
         return {
             "status": "ok",
             "db": str(self.cfg.db_path),
             "counts": counts,
             "last_index": last_dict,
             "project_progress": progress,
+            "current_state": current_state,
+            "last_attempt_at": last_attempt_at,
+            "last_attempt_status": last_attempt_status,
+            "last_successful_index_at": last_successful_at,
+            "age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
+            "freshness_level": freshness_level,
+            "freshness": {
+                "level": freshness_level,
+                "age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
+                "threshold_seconds": round(threshold_seconds, 3),
+                "last_successful_index_at": last_successful_at,
+                "coverage_scope": last_successful_dict.get("coverage_scope") if last_successful_dict else None,
+            },
+            "last_successful_index_run_id": last_successful_dict.get("run_id") if last_successful_dict else None,
+            "last_failure_summary": last_failure_summary,
         }
 

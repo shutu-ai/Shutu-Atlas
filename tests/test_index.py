@@ -312,3 +312,36 @@ def test_removed_project_is_pruned_on_root_refresh(test_config, fixture_root):
     store.index(discover_projects(test_config), changed_only=True)
     assert not any(item["project_id"] == removed.project_id for item in store.list_projects(limit=50))
 
+
+def test_status_distinguishes_root_freshness_from_targeted_retry(test_config):
+    projects = discover_projects(test_config)
+    store = IndexStore(test_config)
+    root_result = store.index(projects, changed_only=True, resume=True)
+    assert root_result["status"] == "ok"
+    status_after_root = IndexStore(test_config).status()
+    assert root_result["coverage_scope"] == "root"
+    assert status_after_root["last_successful_index_at"]
+    assert status_after_root["freshness_level"] == "fresh"
+    assert status_after_root["age_seconds"] >= 0
+    assert status_after_root["last_attempt_status"] == "ok"
+
+    retry = IndexStore(test_config).index(
+        projects,
+        changed_only=True,
+        retry_projects=[projects[0].project_id],
+    )
+    assert retry["status"] == "ok"
+    assert retry["coverage_scope"] == "targeted-retry"
+    status_after_retry = IndexStore(test_config).status()
+    assert status_after_retry["last_index"]["coverage_scope"] == "targeted-retry"
+    assert status_after_retry["last_successful_index_at"] == status_after_root["last_successful_index_at"]
+    assert status_after_retry["freshness"]["coverage_scope"] == "root"
+
+
+def test_index_writer_lock_skips_parallel_entry_point(test_config):
+    projects = discover_projects(test_config)
+    with database_module.index_writer_lock(test_config.db_path):
+        result = IndexStore(test_config).index(projects, changed_only=True, resume=True)
+    assert result["status"] == "skipped_running"
+    assert result["skip_reason"]
+

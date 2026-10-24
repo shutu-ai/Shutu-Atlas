@@ -96,3 +96,22 @@ unverified license status, MCP calls, event log, target Git state, and tests.
 Atlas MCP/Serena environment verified above. It does not claim OpenCode
 support. OpenCode remains `UNVERIFIED` because no authenticated client session
 was completed and no user configuration workaround was made.
+
+## Nightly Auto Index extension (2026-10-24)
+
+This extension preserves the V2 READY boundary and adds only a Windows
+Task-Scheduler wrapper plus status visibility. It does not claim that a
+partial or targeted run is a fresh root index.
+
+| Gate | Status | Evidence |
+| --- | --- | --- |
+| Code implementation | `PASS` | `scripts/nightly-index.ps1`, `scripts/install-nightly-index.ps1`, `scripts/uninstall-nightly-index.ps1`; `--changed-only --resume`, project-local writer lock, log rotation, 02:00–04:00 start guard, low-priority fallback, and accurate exit propagation are covered by `tests/test_nightly_scripts.py` and the index regression suite. |
+| Actual Windows task registration | `PASS` | Live task `Shutu-Atlas Nightly Auto Index` was registered for the current user without elevation and read back from Task Scheduler: `Ready`, daily `02:00 +03:00`, `Interactive`, `Limited`, `RunOnlyIfIdle=true`, `Duration=PT10M`, `WaitTimeout=PT1H`, `IgnoreNew`, `Priority=7`, `StartWhenAvailable=false`, `WakeToRun=false`, `StopOnIdleEnd=false`. A same-task reinstall created a `.local` XML backup. |
+| Automatic-run configuration | `PASS` | The installed action uses Windows PowerShell 5.1, the absolute project script, project working directory, `atlas.toml`, and the project-local integration interpreter. A controlled `Start-ScheduledTask` request stayed `Queued` while idle conditions were not satisfied and was stopped; it did not become a daytime catch-up. |
+| Real changed-only scan | `PASS` | Controlled entry `nightly-index.ps1 -IgnoreTimeWindowForTest` completed run 24 with exit code 0, `status=ok`, 44/44 projects, 87,613 files scanned, 16 changed/indexed files, 87,597 unchanged files, 0 errors, database elapsed 72.814 s, wrapper elapsed 83.366 s, process priority `BelowNormal`. The bypass is not used by the registered task. |
+| Freshness | `PASS` | `atlas status` and `atlas_health` read run 24 as `coverage_scope=root`, `last_successful_index_at=2026-10-24T08:25:32Z`, `freshness_level=fresh`, threshold 93,600 seconds, and a non-negative age. Targeted retry scope is persisted separately. |
+| Regression | `PASS` | Required base run `python -m pytest -q`: `22 passed, 5 skipped in 46.39s`; project integration-venv run: `24 passed, 3 skipped in 58.15s` (including the official MCP health client). `python -m compileall -q src tests`, `node --check web/app.js`, and `git diff --check` passed. |
+| Existing user configuration | `PASS` | `atlas.toml`, `.local\atlas.sqlite3`, historical runs, and existing source roots were retained. Only project-local `.local` runtime state and the requested tracked implementation/docs changed. |
+
+The detailed operating procedure, uninstall command, status example, and
+failure boundaries are in [`Nightly_Auto_Index.md`](Nightly_Auto_Index.md).

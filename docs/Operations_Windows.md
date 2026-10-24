@@ -108,3 +108,29 @@ Cache/generated directories such as `.codegraph`, `.go-cache`,
 `.go-mod-cache`, `.deploy-staging*`, and `pytest-cache-files-*` are excluded
 from source traversal. This is a source-boundary/performance rule, not a
 timeout.
+
+## Nightly Auto Index
+
+The Windows-only nightly wrapper is documented in
+[`Nightly_Auto_Index.md`](Nightly_Auto_Index.md). It reuses the commands above
+and does not change the V2 index engine:
+
+```powershell
+cd D:\dev-projects\Shutu-Atlas
+.\scripts\install-nightly-index.ps1
+Get-ScheduledTask -TaskName 'Shutu-Atlas Nightly Auto Index'
+Get-ScheduledTaskInfo -TaskName 'Shutu-Atlas Nightly Auto Index'
+```
+
+The registered task runs at 02:00 local time only after 10 minutes of idle,
+waits at most one hour for that idle state, uses `IgnoreNew`, does not wake the
+computer, and does not replay a missed run during the day. The entry script
+also rejects starts outside 02:00–04:00 and records JSONL under
+`.local\logs\nightly-index\`. A manual index and the scheduled index share a
+project-local OS writer lock; the safe result is `SKIPPED_RUNNING`.
+
+Freshness in `atlas status` and the read-only `atlas_health` tool is based only
+on the latest successful root-scope run. A project retry or partial run stays
+visible in `last_attempt_status` and does not advance
+`last_successful_index_at`. Use `--retry-project` for a daytime targeted
+recovery, then let the next root changed-only run establish freshness.

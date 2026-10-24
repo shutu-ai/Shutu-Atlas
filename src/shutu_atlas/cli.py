@@ -64,6 +64,8 @@ def cmd_index(args: argparse.Namespace) -> int:
         3,
     )
     _print(result)
+    if result.get("status") == "skipped_running":
+        return 0
     return 0 if result["errors"] == 0 else 2
 
 
